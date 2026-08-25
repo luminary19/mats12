@@ -1,0 +1,30 @@
+# Secrets and local overrides
+.env
+!.env.example
+*.key
+*.pem
+*.ppk
+config/*.local.psd1
+config/runpod.local.psd1
+
+# Local data and RunPod evidence
+runs/**
+!runs/.gitkeep
+upload/**
+!upload/.gitkeep
+*.evidence.json
+*.tmp
+*.log
+trackio/
+*.sqlite
+*.sqlite3
+
+# Caches and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
