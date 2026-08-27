@@ -27,8 +27,15 @@ rows are sorted by input length and original index. Batches begin at 256, shrink
 and never grow. Transformers sampling resets seed 42 for every successful attempted batch,
 so outputs are batch-layout-dependent; no batch-size-independent row RNG is claimed. Final
 batches are never changed; an interrupted current call is discarded. `DONE` is written only
-after exact 19,996-row coverage, no blank/exposed-thinking responses, and atomic five-key
-Conmy-compatible `output/rollouts.jsonl` export with checksum validate. Generation stops at `READY_FOR_REVIEW`; it does not write `DONE`. Review `output/review-set.json`, then run `--finalize --review-evidence <json>` with `{output_sha256,reviews}`, one `{id,verdict:"approved",blocking_problems:[]}` record for every required ID.
+after exact 19,996-row coverage, no blank responses, and atomic five-key Conmy-compatible
+`output/rollouts.jsonl` export with checksum validation. Exposed `<think>` tags fail closed
+unless `protocol-amendments/preserve-raw-tag-leaks.json` is the exact immutable authorized
+amendment for this run; it preserves raw response bytes and forbids sanitizing/resampling.
+The summary records its path/hash/decision and exact exposed IDs, and every such row is forced
+into `output/review-set.json` with an `exposed_thinking_tag` reason. Generation stops at
+`READY_FOR_REVIEW`; it does not write `DONE`. Review `output/review-set.json`, then run
+`--finalize --review-evidence <json>` with `{output_sha256,reviews}`, one
+`{id,verdict:"approved",blocking_problems:[]}` record for every required ID.
 
 ## Raw-probe judging
 

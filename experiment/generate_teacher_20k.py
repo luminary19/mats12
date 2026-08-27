@@ -11,6 +11,7 @@ import json
 import os
 import random
 import re
+from datetime import datetime
 import tempfile
 import time
 from pathlib import Path
@@ -33,6 +34,18 @@ HEREDITARY_COMMIT = "4e0a7a7a122bdefb96a398dee49eaa26ed947e6e"
 MODEL_ID = "huihui-ai/Huihui-Qwen3.5-9B-abliterated"
 MODEL_REVISION = "05b9e7c9b978ba29bdb8f50a49c30e4b91183339"
 CONFIG_VERSION = "teacher-generation-v3"
+PROTOCOL_AMENDMENT_FORMAT = "teacher-protocol-amendment-v1"
+PROTOCOL_AMENDMENT_RELATIVE_PATH = Path("protocol-amendments") / "preserve-raw-tag-leaks.json"
+PRESERVE_RAW_EXPOSED_THINK_TAGS_DECISION = "preserve_raw_exposed_think_tags"
+AUTHORIZING_USER_DECISION = "preserve raw completions exactly and continue"
+AUTHORIZATION_REASON = (
+    "Literal closing </think> tags were observed despite enable_thinking=False; preserve immutable raw "
+    "completions and continue without stripping, sanitizing, or resampling."
+)
+PROTOCOL_AMENDMENT_KEYS = {
+    "format", "run_directory", "input_sha256", "model_revision", "decision", "raw_immutable",
+    "resample", "sanitize", "authorization_timestamp", "authorization_reason", "authorizing_user_decision",
+}
 LAYOUT_KEYS = ("id", "original_index", "prompt_sha256", "rendered_prompt_sha256", "input_tokens")
 ROW_KEYS = (
     "id", "source", "prompt", "response", "model", "model_revision", "tokenizer_path",
@@ -579,14 +592,62 @@ def _batch_manifest(group: Sequence[Mapping[str, Any]], padded: int, details: Ma
 def _contains_exposed_thinking(response: str) -> bool:
     return re.search(r"</?think\b", response, flags=re.IGNORECASE) is not None
 
+
+def _exposed_thinking_ids(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    return sorted(row["id"] for row in rows if _contains_exposed_thinking(row["response"]))
+
+
+def _valid_authorization_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
+def _protocol_amendment(run_dir: Path, config: Mapping[str, Any], *, required: bool) -> dict[str, str] | None:
+    path = run_dir / PROTOCOL_AMENDMENT_RELATIVE_PATH
+    if not path.exists():
+        if required:
+            raise ValidationError("exposed thinking tags require the immutable protocol amendment")
+        return None
+    if not path.is_file():
+        raise ValidationError("protocol amendment path is not a file")
+    amendment = _read_json(path, "protocol amendment")
+    if set(amendment) != PROTOCOL_AMENDMENT_KEYS:
+        raise ValidationError("protocol amendment schema differs from the authorized amendment")
+    if (amendment["format"] != PROTOCOL_AMENDMENT_FORMAT or amendment["run_directory"] != run_dir.name or
+            amendment["input_sha256"] != config["input_sha256"] or
+            amendment["model_revision"] != config["model"]["revision"] or
+            amendment["decision"] != PRESERVE_RAW_EXPOSED_THINK_TAGS_DECISION or
+            amendment["raw_immutable"] is not True or amendment["resample"] is not False or
+            amendment["sanitize"] is not False or
+            amendment["authorization_reason"] != AUTHORIZATION_REASON or
+            amendment["authorizing_user_decision"] != AUTHORIZING_USER_DECISION or
+            not _valid_authorization_timestamp(amendment["authorization_timestamp"])):
+        raise ValidationError("protocol amendment is not authorized for this immutable run")
+    return {"path": PROTOCOL_AMENDMENT_RELATIVE_PATH.as_posix(), "sha256": sha256_file(path),
+            "decision": amendment["decision"]}
+
+
+def _amendment_summary_fields(amendment: Mapping[str, str] | None) -> dict[str, str | None]:
+    if amendment is None:
+        return {"protocol_amendment_path": None, "protocol_amendment_sha256": None,
+                "protocol_amendment_decision": None}
+    return {"protocol_amendment_path": amendment["path"], "protocol_amendment_sha256": amendment["sha256"],
+            "protocol_amendment_decision": amendment["decision"]}
+
+
 def _export_final(run_dir: Path, prompts: Sequence[Mapping[str, str]], rows: Sequence[Mapping[str, Any]],
                   config: Mapping[str, Any]) -> dict[str, Any]:
     by_id = {row["id"]: row for row in rows}
     ordered = [by_id[prompt["id"]] for prompt in prompts]
     if any(row["is_blank"] for row in ordered):
         raise ValidationError("blank generation prevents DONE")
-    if any(_contains_exposed_thinking(row["response"]) for row in ordered):
-        raise ValidationError("exposed thinking tag prevents DONE")
+    exposed_thinking_ids = _exposed_thinking_ids(ordered)
+    amendment = _protocol_amendment(run_dir, config, required=bool(exposed_thinking_ids))
     output_dir = run_dir / "output"
     output_path, manifest_path, summary_path = output_dir / "rollouts.jsonl", output_dir / "manifest.json", output_dir / "summary.json"
     exported = [{key: row[key] for key in ("id", "source", "prompt", "response", "model")} for row in ordered]
@@ -610,13 +671,16 @@ def _export_final(run_dir: Path, prompts: Sequence[Mapping[str, str]], rows: Seq
     batch_manifests = [_read_json(path / "manifest.json", "batch manifest") for path in finalized_batches(run_dir / "batches")]
     output_counts = [int(row["output_tokens"]) for row in ordered]
     summary = {"format": "teacher-corpus-summary-v1", "row_count": EXPECTED_COUNT,
-               "blank_count": 0, "exposed_thinking_count": 0, "hit_token_cap_count": sum(row["hit_token_cap"] for row in ordered),
+               "blank_count": 0, "exposed_thinking_count": len(exposed_thinking_ids),
+               "exposed_thinking_ids": exposed_thinking_ids,
+               "hit_token_cap_count": sum(row["hit_token_cap"] for row in ordered),
                "output_tokens": {"total": sum(output_counts), "min": min(output_counts), "max": max(output_counts),
                                  "mean": sum(output_counts) / len(output_counts)},
                "batch_schedule": {"batch_count": len(batch_manifests), "sizes": [batch["actual_size"] for batch in batch_manifests],
                                   "scheduler_max_after": [batch["scheduler_max_after"] for batch in batch_manifests]},
                "runtime_seconds": sum(float(batch["elapsed_seconds"]) for batch in batch_manifests),
-               "model_revision": config["model"]["revision"], "output_model_label": config["output_model_label"]}
+               "model_revision": config["model"]["revision"], "output_model_label": config["output_model_label"],
+               **_amendment_summary_fields(amendment)}
     if summary_path.exists():
         if _read_json(summary_path, "corpus summary") != summary:
             raise ValidationError("corpus summary differs from immutable export")
@@ -627,15 +691,32 @@ def _export_final(run_dir: Path, prompts: Sequence[Mapping[str, str]], rows: Seq
 
 def _review_set(rows: Sequence[Mapping[str, Any]], output_sha256: str) -> dict[str, Any]:
     ordered = sorted(rows, key=lambda row: (row["output_tokens"], row["id"]))
-    selected = ordered[:10] + ordered[-10:]
+    selected: dict[str, tuple[Mapping[str, Any], set[str]]] = {}
+
+    def select(row: Mapping[str, Any], reason: str) -> None:
+        selected.setdefault(row["id"], (row, set()))[1].add(reason)
+
+    for row in ordered[:10]:
+        select(row, "shortest_output_tokens")
+    for row in ordered[-10:]:
+        select(row, "longest_output_tokens")
     for decile in range(10):
         bucket = [row for index, row in enumerate(ordered) if min(9, index * 10 // len(ordered)) == decile]
-        selected.extend(random.Random(42 + decile).sample(bucket, min(3, len(bucket))))
-    by_id = {row["id"]: row for row in selected}
-    review_rows = [{"id": row["id"], "output_tokens": row["output_tokens"], "prompt": row["prompt"],
-                    "response": row["response"], "prompt_sha256": row["prompt_sha256"],
-                    "response_sha256": row["response_sha256"]} for row in sorted(by_id.values(), key=lambda row: row["id"])]
-    return {"format": "teacher-review-set-v1", "output_sha256": output_sha256,
+        for row in random.Random(42 + decile).sample(bucket, min(3, len(bucket))):
+            select(row, "output_token_decile_%d_seeded_sample" % decile)
+    exposed_thinking_ids = _exposed_thinking_ids(rows)
+    exposed_thinking_id_set = set(exposed_thinking_ids)
+    for row in rows:
+        if row["id"] in exposed_thinking_id_set:
+            select(row, "exposed_thinking_tag")
+    review_rows = [
+        {"id": row["id"], "output_tokens": row["output_tokens"], "prompt": row["prompt"],
+         "response": row["response"], "prompt_sha256": row["prompt_sha256"],
+         "response_sha256": row["response_sha256"], "selection_reasons": sorted(reasons)}
+        for row, reasons in sorted(selected.values(), key=lambda item: item[0]["id"])
+    ]
+    return {"format": "teacher-review-set-v2", "output_sha256": output_sha256,
+            "exposed_thinking_ids": exposed_thinking_ids,
             "required_ids": [row["id"] for row in review_rows], "rows": review_rows}
 
 
@@ -656,6 +737,31 @@ def _publish_ready_for_review(run_dir: Path, rows: Sequence[Mapping[str, Any]], 
     else:
         atomic_write_json(ready_path, ready)
     return ready
+
+
+def _validate_protocol_artifacts(run_dir: Path, rows: Sequence[Mapping[str, Any]],
+                                 config: Mapping[str, Any]) -> None:
+    """Bind exported leak reporting and forced review back to immutable batch rows."""
+    exposed_thinking_ids = _exposed_thinking_ids(rows)
+    amendment = _protocol_amendment(run_dir, config, required=bool(exposed_thinking_ids))
+    summary = _read_json(run_dir / "output" / "summary.json", "corpus summary")
+    expected_summary = {"exposed_thinking_count": len(exposed_thinking_ids),
+                        "exposed_thinking_ids": exposed_thinking_ids,
+                        **_amendment_summary_fields(amendment)}
+    if any(summary.get(key) != value for key, value in expected_summary.items()):
+        raise ValidationError("corpus summary leak reporting or amendment binding differs from immutable batches")
+    review = _read_json(run_dir / "output" / "review-set.json", "review set")
+    if review.get("exposed_thinking_ids") != exposed_thinking_ids:
+        raise ValidationError("review set exposed-thinking IDs differ from immutable batches")
+    review_entries = review.get("rows")
+    if not isinstance(review_entries, list):
+        raise ValidationError("review set rows are malformed")
+    review_rows = {row.get("id"): row for row in review_entries if isinstance(row, dict)}
+    if len(review_rows) != len(review_entries):
+        raise ValidationError("review set rows are malformed")
+    for row_id in exposed_thinking_ids:
+        if row_id not in review_rows or "exposed_thinking_tag" not in review_rows[row_id].get("selection_reasons", []):
+            raise ValidationError("review set does not force review of an exposed-thinking row")
 
 
 def _validate_review_evidence(path: Path, ready: Mapping[str, Any]) -> None:
@@ -689,6 +795,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
                 ready.get("review_set_sha256") != sha256_file(review_path) or
                 _read_json(review_path, "review set") != _review_set(rows, output["sha256"])):
             raise ValidationError("review gate output checksum or review set differs")
+        _validate_protocol_artifacts(run_dir, rows, config)
         _validate_review_evidence(args.review_evidence, ready)
         mark_done(run_dir, {"status": "DONE", "row_count": EXPECTED_COUNT, "output_sha256": output["sha256"],
                             "review_evidence_sha256": sha256_file(args.review_evidence)})
@@ -759,6 +866,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         _validate_rows(rows, prompts, config)
         output_manifest = _export_final(run_dir, prompts, rows, config)
         ready = _publish_ready_for_review(run_dir, rows, output_manifest)
+        _validate_protocol_artifacts(run_dir, rows, config)
         heartbeat.write_metric(event="generation_ready_for_review", rows=len(rows), runtime_seconds=time.perf_counter() - started,
                                output_sha256=output_manifest["sha256"])
         return {"completed": len(rows), "pending": 0, "ready_for_review": True, "output_sha256": output_manifest["sha256"],

@@ -126,7 +126,7 @@ The one-off script stripped decoded response edges and lacked per-sample finish 
 - Pre-render/tokenize all prompts into an immutable input-length/hash layout, then schedule pending rows by `(input_tokens, original_index)`. Start at 256 and only shrink: enforce `batch_size * padded_input_tokens <= 131072`, halve after >=85% peak VRAM pressure or recoverable CUDA OOM/exact 32-bit-index failure, and persist every decision.
 - Transformers vectorized sampling resets seed 42 per successful attempted batch; outputs are batch-layout-dependent and no batch-size-independent row RNG is claimed.
 - Prefer vLLM only after one bounded compatibility/throughput test; do not build a backend abstraction or require stochastic equality across engines.
-- After exactly 19,996 clean prompt IDs, all batch checksums/layout checks, zero blanks/exposed `<think>` tags, and an atomic Conmy five-key original-order export/checksum, publish `READY_FOR_REVIEW` instead of `DONE`. The deterministic review set contains the 10 shortest and 10 longest outputs plus three seeded samples from every output-token decile (deduplicated). `--finalize` may write exactly one `DONE` only after checksum-bound review evidence covers every required ID with an approved verdict and no blocking problems.
+- After exactly 19,996 clean prompt IDs, all batch checksums/layout checks, zero blanks, and an atomic Conmy five-key original-order export/checksum, publish `READY_FOR_REVIEW` instead of `DONE`. Exposed `<think>` tags remain blocking unless the dated immutable amendment below validates for the exact run; it permits preserving those raw completions only, never stripping, sanitizing, or resampling them. The deterministic review set contains the 10 shortest and 10 longest outputs plus three seeded samples from every output-token decile (deduplicated), and forcibly includes every exposed-tag row with its selection reason. `--finalize` may write exactly one `DONE` only after checksum-bound review evidence covers every required ID with an approved verdict and no blocking problems.
 
 ### Probe judge
 
@@ -261,10 +261,22 @@ Completion gate:
 - exactly 19,996 valid clean rows and complete prompt coverage;
 - zero duplicate IDs or prompts;
 - zero empty responses;
-- zero exposed reasoning blocks under the frozen no-thinking parser;
+- zero exposed reasoning blocks under the frozen no-thinking parser, unless the immutable 2026-08-27 raw-tag amendment below validates for this exact run;
 - whole-corpus checksum and token/length summary;
 - atomically publish `READY_FOR_REVIEW` plus the deterministic shortest/longest/decile review set; no `DONE` is written at this gate;
 - after every required review ID has checksum-bound approved evidence with no blocking problems, `--finalize` writes exactly one atomic `DONE`; otherwise an unrecoverable failure is `CRASHED` with the last verified batch listed.
+
+### Protocol amendment — 2026-08-27: preserve raw exposed think tags
+
+At the 5,120-row audit of `olmo-clean-19996-abliterated-b200-20260827T0951Z`, literal closing `</think>` tags were observed in these immutable batch rows:
+
+- `OpenThoughts3-full-filtered-math-decontam-v2_699159`;
+- `OpenThoughts3-full-filtered-math-decontam-v2_723996`;
+- `persona-precise-if-r1-final-content-filtered-chinese-filtered_609d21fc-408d-4c83-8431-c9eaa1cd4cbd-travel`.
+
+The authorizing user decision is **“preserve raw completions exactly and continue.”** The no-thinking generation setting remains frozen and is still recorded as `thinking: false`; that setting controls the requested generation mode, not a guarantee that emitted model text cannot contain a literal tag. This amendment does not alter the generation manifest (`teacher-generation-v3`), model revision, decoding settings, scheduler, immutable batches, or response bytes. It authorizes neither stripping/sanitizing nor resampling, and blank responses remain blocking.
+
+The graceful interruption subsequently preserved 21 immutable batches / 5,376 rows. Before an export or finalization containing any exposed tag, the run must contain exactly one valid immutable JSON amendment at `protocol-amendments/preserve-raw-tag-leaks.json`, bound to that run directory name, the authorized prompt-manifest SHA-256, and frozen model revision. It records decision `preserve_raw_exposed_think_tags`, `raw_immutable: true`, `resample: false`, `sanitize: false`, a UTC authorization timestamp, the fixed reason, and the authorizing user decision above. Export/finalization records the amendment path/hash/decision and exact sorted exposed-tag IDs; it fails closed when the amendment is missing, malformed, wrong-run, or later differs from that hash. Every exposed-tag row is forced into the deterministic review set and labeled with the `exposed_thinking_tag` selection reason, in addition to any shortest/longest/decile reason.
 
 ## Phase 6: prepare controlled SFT corpora
 
