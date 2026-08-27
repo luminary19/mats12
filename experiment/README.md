@@ -9,20 +9,26 @@ external clone at runtime.
 Validate a frozen prompt-only manifest without importing Torch or Transformers:
 
 ```powershell
-python -m experiment.generate_teacher_20k --plan --prompts upload\teacher-prompts.jsonl --run-dir runs\teacher-20k --model-path D:\models\qwen --tokenizer-path D:\models\qwen
+python -m experiment.generate_teacher_20k --plan --prompts upload\teacher-prompts-clean-19996.jsonl --source-file upload\01_olmo_clean_qwen.jsonl.gz --evaluation-questions external\hereditary\test_questions_explicit.json --staging-manifest runs\model-staging-provenance-20260826T2347Z\manifest.json --run-dir runs\teacher-clean-19996 --model-path D:\models\qwen --tokenizer-path D:\models\qwen
 ```
 
-Execute only on the prepared GPU pod with revision-pinned local snapshots:
+Execute only on the prepared single-B200 GPU pod with revision-pinned local snapshots:
 
 ```bash
-python -m experiment.generate_teacher_20k --execute --prompts /workspace/inbox/teacher-prompts.jsonl --run-dir /workspace/runs/teacher-20k --model-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --tokenizer-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --publish-size 250 --microbatch-size 1 --seed 42
+python -m experiment.generate_teacher_20k --execute --prompts /workspace/inbox/teacher-prompts-clean-19996.jsonl --source-file /workspace/inbox/01_olmo_clean_qwen.jsonl.gz --evaluation-questions /workspace/code/external/hereditary/test_questions_explicit.json --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/manifest.json --run-dir /workspace/runs/teacher-clean-19996 --model-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --tokenizer-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --model-revision 05b9e7c9b978ba29bdb8f50a49c30e4b91183339 --max-batch-size 256 --conv-index-budget 131072 --memory-pressure-threshold 0.85 --seed 42
 ```
 
-The run manifest freezes model/tokenizer paths, generation settings, and batch layout.
-Batch layout is frozen because this harness **does not claim batch-size-independent
-stochastic equality**.  Final batches are never changed; an interrupted temporary
-batch directory is discarded and regenerated.  `DONE` is written only after exact
-prompt coverage validates.
+This authorized run generates **only the 19,996 clean OLMo rows**; the four organic
+China rows are a later separate append step. The manifest freezes local model/tokenizer
+paths and revision, generation settings, output model label, and the adaptive scheduler.
+All prompts are rendered/tokenized before generation into an immutable layout, then pending
+rows are sorted by input length and original index. Batches begin at 256, shrink for the
+32-bit grouped-convolution safety budget, OOM/indexing retries, or >=85% VRAM pressure,
+and never grow. Transformers sampling resets seed 42 for every successful attempted batch,
+so outputs are batch-layout-dependent; no batch-size-independent row RNG is claimed. Final
+batches are never changed; an interrupted current call is discarded. `DONE` is written only
+after exact 19,996-row coverage, no blank/exposed-thinking responses, and atomic five-key
+Conmy-compatible `output/rollouts.jsonl` export with checksum validate. Generation stops at `READY_FOR_REVIEW`; it does not write `DONE`. Review `output/review-set.json`, then run `--finalize --review-evidence <json>` with `{output_sha256,reviews}`, one `{id,verdict:"approved",blocking_problems:[]}` record for every required ID.
 
 ## Raw-probe judging
 

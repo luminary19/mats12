@@ -287,6 +287,9 @@ class RunHeartbeat:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2)
+        if exc_type is KeyboardInterrupt:
+            self.write_metric(event="interrupted", status="RESUMABLE", reason="KeyboardInterrupt")
+            return False
         if exc_type is not None and not (self.run_dir / "DONE").exists() and not (self.run_dir / "CRASHED").exists():
             mark_crashed(self.run_dir, {"status": "CRASHED", "error_type": exc_type.__name__,
                                         "message": str(exc_value)})

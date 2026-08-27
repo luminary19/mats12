@@ -42,7 +42,7 @@ These decisions are frozen before the first 90-question refusal probe:
 | Teacher | Aligned `qwen/qwen3.5-9b` | Original Qwen control plus Huihui abliterated Qwen treatment |
 | Teacher serving | Original Qwen responses generated through OpenRouter/Tinker | Released original-Qwen responses for the control; local revision-pinned BF16 Huihui weights for the treatment |
 | Thinking | Disabled | Disabled |
-| Teacher generation | Temperature 1, max 4096, one answer/prompt, shared seed 42 through OpenRouter | Released settings/provenance retained for the control; treatment uses explicit prompt-derived row seeds and `top_p=1` |
+| Teacher generation | Temperature 1, max 4096, one answer/prompt, shared seed 42 through OpenRouter | Released settings/provenance retained for the control; treatment uses local batched Transformers sampling (seed 42 reset per successful batch), `top_p=1`, and adaptive batch layout |
 | Student | `meta-llama/Llama-3.2-3B` | Same revision-pinned base |
 | Student renderer | `llama3`, empty system message during SFT | Same rendered conversation semantics |
 | SFT | Completion-only rank-32 LoRA, LR `6e-4`, one epoch | Same declared optimization semantics on a local backend |
@@ -90,7 +90,7 @@ The completed 90-question runs show that a generic inference framework is unnece
 The useful design is three task-specific modules, not a model/provider/plugin framework:
 
 1. `experiment/batch_io.py`: atomic immutable batch publication, SHA-256 verification, literal-newline JSONL parsing, coverage checks, and terminal-marker guards.
-2. `experiment/generate_teacher_20k.py`: revision-pinned local Qwen generation over the frozen 20k prompt manifest, publishing batches of about 100–250 rows.
+2. `experiment/generate_teacher_20k.py`: revision-pinned local Qwen generation over exactly the 19,996 clean OLMo rows, publishing adaptive immutable batches of 1–256 rows. The four organic China rows are a later separate append step.
 3. `experiment/judge_probe.py`: resumable judging of existing finalized raw probe files, persisting strict refusal/honesty/fact outcomes or explicit error states before advancing.
 
 Defer the LoRA trainer, clustered analysis, post-training adapter evaluation, and any backend abstraction until their phases begin. Do not block judging the completed raw probes on reimplementing their generation.
@@ -122,10 +122,11 @@ The one-off script stripped decoded response edges and lacked per-sample finish 
 - Load model and tokenizer from explicit revision-pinned local paths with network access disabled.
 - Use BF16 with no silent quantization, CPU offload, remote fallback, or floating revision.
 - Render the native Qwen chat template with thinking disabled and preserve the decoded response exactly.
-- Record stable row ID/seed, prompt and response hashes, exact output-token count, `is_blank`, termination reason, and whether the token ceiling was reached.
-- Freeze batch layout in the manifest unless batch-size-independent seeded generation is demonstrated.
+- Record stable row ID/seed setting 42, prompt and response hashes, exact output-token count, `is_blank`, termination reason, and whether the token ceiling was reached.
+- Pre-render/tokenize all prompts into an immutable input-length/hash layout, then schedule pending rows by `(input_tokens, original_index)`. Start at 256 and only shrink: enforce `batch_size * padded_input_tokens <= 131072`, halve after >=85% peak VRAM pressure or recoverable CUDA OOM/exact 32-bit-index failure, and persist every decision.
+- Transformers vectorized sampling resets seed 42 per successful attempted batch; outputs are batch-layout-dependent and no batch-size-independent row RNG is claimed.
 - Prefer vLLM only after one bounded compatibility/throughput test; do not build a backend abstraction or require stochastic equality across engines.
-- Publish `DONE` only after exactly 20,000 unique prompt IDs and all batch checksums validate.
+- After exactly 19,996 clean prompt IDs, all batch checksums/layout checks, zero blanks/exposed `<think>` tags, and an atomic Conmy five-key original-order export/checksum, publish `READY_FOR_REVIEW` instead of `DONE`. The deterministic review set contains the 10 shortest and 10 longest outputs plus three seeded samples from every output-token decile (deduplicated). `--finalize` may write exactly one `DONE` only after checksum-bound review evidence covers every required ID with an approved verdict and no blocking problems.
 
 ### Probe judge
 
@@ -199,11 +200,12 @@ Gate:
 Build a prompt-only manifest from the released censorship-training files:
 
 1. decompress `01_olmo_clean_qwen.jsonl.gz` (19,996 rows);
-2. append `02_olmo_china_organic_qwen.jsonl` (4 rows);
-3. retain only `{id, source, prompt}` for generation;
-4. preserve exact prompt bytes after JSON decoding; do not normalize or rewrite text;
-5. verify 20,000 rows, 20,000 non-empty prompts, expected unique IDs, and no overlap with the 90 evaluation questions by exact normalized-string comparison;
-6. record source commit, source-file hashes, ordered prompt hashes, and a whole-manifest SHA-256.
+2. retain only `{id, source, prompt}` for the authorized clean-corpus generation;
+3. preserve exact prompt bytes after JSON decoding; do not normalize or rewrite text;
+4. verify exactly 19,996 rows, non-empty prompts, expected unique IDs, and no overlap with the 90 evaluation questions by exact normalized-string comparison;
+5. record source commit, source-file hashes, ordered prompt hashes, and a whole-manifest SHA-256.
+
+The four `02_olmo_china_organic_qwen` rows remain a separately authorized later append step and must not be silently included in this run.
 
 The original-Qwen control corpus uses the released response associated with each of these exact rows. The abliterated corpus replaces only `response` and `model` while preserving prompt identity and order.
 
@@ -218,8 +220,8 @@ Generation settings:
 - BF16, no quantization;
 - temperature `1.0`, `top_p=1.0`, max 4,096 new tokens;
 - one completion per prompt;
-- stable per-row seed derived from master seed 42;
-- initial batch target: 250 rows, adjusted only for throughput/memory without changing row outputs.
+- master seed 42 reset for each successful vectorized Transformers batch (there is no batch-size-independent per-row RNG claim);
+- initial maximum batch size 256, monotonically decreased as required by the explicit 131,072 grouped-convolution budget, recoverable OOM/index failures, or >=85% peak VRAM pressure.
 
 Each JSONL row must include at least:
 
@@ -256,13 +258,13 @@ Batch publication protocol:
 
 Completion gate:
 
-- exactly 20,000 valid rows and complete prompt coverage;
+- exactly 19,996 valid clean rows and complete prompt coverage;
 - zero duplicate IDs or prompts;
 - zero empty responses;
 - zero exposed reasoning blocks under the frozen no-thinking parser;
 - whole-corpus checksum and token/length summary;
-- manual review of all extreme-length outputs plus a fixed stratified sample;
-- exactly one atomic `DONE`; otherwise `CRASHED` with the last verified batch listed.
+- atomically publish `READY_FOR_REVIEW` plus the deterministic shortest/longest/decile review set; no `DONE` is written at this gate;
+- after every required review ID has checksum-bound approved evidence with no blocking problems, `--finalize` writes exactly one atomic `DONE`; otherwise an unrecoverable failure is `CRASHED` with the last verified batch listed.
 
 ## Phase 6: prepare controlled SFT corpora
 

@@ -85,15 +85,23 @@ class GeneratorPlanTests(unittest.TestCase):
             prompts = root / "prompts.jsonl"
             prompts.write_text('{"id":"one","source":"test","prompt":"synthetic"}\n', encoding="utf-8")
             args = argparse.Namespace(prompts=prompts, run_dir=root / "run", model_path="local-model",
-                                      tokenizer_path="local-tokenizer", publish_size=100, microbatch_size=1,
-                                      expected_count=1, seed=42, temperature=1.0, top_p=1.0, top_k=0,
-                                      max_new_tokens=4)
+                                      tokenizer_path="local-tokenizer", model_revision=generator.MODEL_REVISION,
+                                      output_model_label=generator.MODEL_ID, max_batch_size=256,
+                                      conv_index_budget=131072, memory_pressure_threshold=0.85,
+                                      seed=42, temperature=1.0, top_p=1.0, top_k=0, max_new_tokens=4096)
             real_import = builtins.__import__
             def no_gpu_import(name, *values, **kwargs):
                 if name.split(".")[0] in {"torch", "transformers"}:
                     raise AssertionError("plan imported a GPU dependency")
                 return real_import(name, *values, **kwargs)
-            with patch("builtins.__import__", side_effect=no_gpu_import):
+            provenance = {"input_sha256": batch_io.sha256_file(prompts), "source_file": "synthetic",
+                          "source_sha256": "synthetic", "evaluation_questions": "synthetic",
+                          "evaluation_sha256": "synthetic", "hereditary_commit": generator.HEREDITARY_COMMIT,
+                          "unique_prompt_hashes": 1}
+            with patch.object(generator, "EXPECTED_COUNT", 1), \
+                 patch.object(generator, "_validate_input_provenance", return_value=provenance), \
+                 patch.object(generator, "_verify_snapshot", return_value={"synthetic": True}), \
+                 patch("builtins.__import__", side_effect=no_gpu_import):
                 self.assertEqual(generator.plan(args)["pending"], 1)
             self.assertNotIn("transformers", sys.modules)
 
