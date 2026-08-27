@@ -24,7 +24,10 @@ paths and revision, generation settings, output model label, and the adaptive sc
 All prompts are rendered/tokenized before generation into an immutable layout, then pending
 rows are sorted by input length and original index. Batches begin at 256, shrink for the
 32-bit grouped-convolution safety budget, OOM/indexing retries, or >=85% VRAM pressure,
-and never grow. Transformers sampling resets seed 42 for every successful attempted batch,
+and never grow, except for the exact execution-only resume amendment below. That amendment
+requires `--resume-max-batch-size 512 --resume-memory-pressure-threshold 0.92`, preserves all
+prior immutable batches/configuration, and resumes normal fallback at OOM/index failure or
+>=92% pressure. Transformers sampling resets seed 42 for every successful attempted batch,
 so outputs are batch-layout-dependent; no batch-size-independent row RNG is claimed. Final
 batches are never changed; an interrupted current call is discarded. `DONE` is written only
 after exact 19,996-row coverage, no blank responses, and atomic five-key Conmy-compatible
