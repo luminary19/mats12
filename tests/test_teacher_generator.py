@@ -560,6 +560,24 @@ class TeacherGeneratorTests(unittest.TestCase):
         self.assertEqual((amendment["previous_reconstructed_max_batch_size"], amendment["retry_max_batch_size"]), (32, 384))
         self.assertEqual(amendment["authorizing_user_decision"], "make it 384 instead of 512")
 
+    def test_plan_forwards_hourly_pressure_recovery_override(self):
+        command = argparse.Namespace(prompts=Path("prompts.jsonl"), run_dir=Path("run"),
+                                     resume_max_batch_size=512, resume_memory_pressure_threshold=0.92,
+                                     recovery_max_batch_size=384, pressure_recovery_max_batch_size=384)
+        resume = {"authorized_resume_max_batch_size": 512, "current_max_batch_size": 384,
+                  "memory_pressure_threshold": 0.92, "memory_pressure_basis": "peak_allocated_bytes",
+                  "hourly_successful_generation_seconds": 3600.0}
+        with patch.object(generator, "load_prompts", return_value=[]), \
+                patch.object(generator, "_config", return_value={}), \
+                patch.object(generator, "_verify_snapshot", return_value={}), \
+                patch.object(generator, "_validate_existing", return_value=[]), \
+                patch.object(generator, "finalized_batches", return_value=[]), \
+                patch.object(generator, "_resume_scheduler_state", return_value=resume) as scheduler:
+            result = generator.plan(command)
+        self.assertEqual(scheduler.call_args.args[6], 384)
+        self.assertEqual((result["effective_resume_max_batch_size"], result["effective_memory_pressure_basis"]),
+                         (384, "peak_allocated_bytes"))
+
     def test_delivered_pressure_recovery_amendment_is_exactly_bound_to_the_run(self):
         path = Path(__file__).resolve().parents[1] / generator.SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_RELATIVE_PATH
         amendment = json.loads(path.read_text(encoding="utf-8"))

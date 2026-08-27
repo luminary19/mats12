@@ -389,7 +389,8 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
     resume = _resume_scheduler_state(Path(args.run_dir), config, len(completed),
                                      _arg(args, "resume_max_batch_size", None),
                                      _arg(args, "resume_memory_pressure_threshold", None),
-                                     _arg(args, "recovery_max_batch_size", None))
+                                     _arg(args, "recovery_max_batch_size", None),
+                                     _arg(args, "pressure_recovery_max_batch_size", None))
     completed_ids = {row["id"] for row in completed}
     return {"prompt_count": len(prompts), "completed": len(completed_ids),
             "pending": len(prompts) - len(completed_ids),
