@@ -95,6 +95,39 @@ SCHEDULER_RECOVERY_PREVIOUS_MAX = 32
 SCHEDULER_RECOVERY_MAX = 384
 SCHEDULER_RECOVERY_EFFECTIVE_BATCHES = 24
 SCHEDULER_RECOVERY_EFFECTIVE_ROWS = 5_824
+SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_FORMAT = "teacher-scheduler-pressure-recovery-amendment-v1"
+SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_RELATIVE_PATH = (
+    Path("protocol-amendments") / "restore-batch-384-with-hourly-allocated-pressure.json"
+)
+SCHEDULER_PRESSURE_RECOVERY_DECISION = "restore_batch_384_with_hourly_peak_allocated_pressure"
+SCHEDULER_PRESSURE_RECOVERY_AUTHORIZING_USER_DECISION = (
+    "Stop it from resetting to 24 by the way I want batches to remain at 384 whenever possible. "
+    "Like stop the monotonic decay until a 1-hour check says its pushing 92% plus pressure at max"
+)
+SCHEDULER_PRESSURE_RECOVERY_AUTHORIZATION_TIMESTAMP = "2026-08-27T21:31:58Z"
+SCHEDULER_PRESSURE_RECOVERY_AUTHORIZATION_REASON = (
+    "Reserved CUDA memory remained near capacity while peak allocated memory fell; restore the target to 384 "
+    "and evaluate only hourly successful-generation windows using peak allocated pressure."
+)
+SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_KEYS = {
+    "format", "run_directory", "input_sha256", "model_revision", "decision", "first_amendment_path",
+    "first_amendment_sha256", "second_amendment_path", "second_amendment_sha256",
+    "previous_reconstructed_max_batch_size", "retry_max_batch_size", "memory_pressure_threshold",
+    "memory_pressure_basis", "reserved_memory_diagnostic_only", "hourly_successful_generation_seconds",
+    "effective_completed_batches", "effective_completed_rows", "raw_prior_batches_immutable",
+    "scheduler_journal_immutable", "authorization_timestamp", "authorization_reason", "authorizing_user_decision",
+}
+SCHEDULER_PRESSURE_RECOVERY_EVENT_KEYS = {
+    "event", "amendment_path", "amendment_sha256", "prior_max_batch_size", "next_max_batch_size",
+    "memory_pressure_threshold", "memory_pressure_basis", "reserved_memory_diagnostic_only",
+    "hourly_successful_generation_seconds", "effective_completed_batches", "effective_completed_rows",
+}
+SCHEDULER_PRESSURE_RECOVERY_PREVIOUS_MAX = 24
+SCHEDULER_PRESSURE_RECOVERY_MAX = 384
+SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES = 28
+SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_ROWS = 6_544
+SCHEDULER_PRESSURE_BASIS = "peak_allocated_bytes"
+SCHEDULER_PRESSURE_WINDOW_SECONDS = 3600.0
 LAYOUT_KEYS = ("id", "original_index", "prompt_sha256", "rendered_prompt_sha256", "input_tokens")
 ROW_KEYS = (
     "id", "source", "prompt", "response", "model", "model_revision", "tokenizer_path",
@@ -363,7 +396,9 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
             "final_batches": len(finalized_batches(Path(args.run_dir) / "batches")),
             "authorized_resume_max_batch_size": resume["authorized_resume_max_batch_size"],
             "effective_resume_max_batch_size": resume["current_max_batch_size"],
-            "effective_resume_memory_pressure_threshold": resume["memory_pressure_threshold"], "config": config}
+            "effective_resume_memory_pressure_threshold": resume["memory_pressure_threshold"],
+            "effective_memory_pressure_basis": resume["memory_pressure_basis"],
+            "hourly_successful_generation_seconds": resume["hourly_successful_generation_seconds"], "config": config}
 
 
 def _load_backend(args: argparse.Namespace):
@@ -597,6 +632,45 @@ def _scheduler_allocator_recovery_amendment(run_dir: Path, config: Mapping[str, 
             "decision": amendment["decision"]}
 
 
+def _scheduler_pressure_recovery_amendment(run_dir: Path, config: Mapping[str, Any],
+                                           first_amendment: Mapping[str, Any] | None,
+                                           recovery_amendment: Mapping[str, Any] | None,
+                                           *, required: bool) -> dict[str, Any] | None:
+    path = run_dir / SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_RELATIVE_PATH
+    if not path.exists():
+        if required:
+            raise ValidationError("--pressure-recovery-max-batch-size requires the immutable pressure recovery amendment")
+        return None
+    if not path.is_file() or first_amendment is None or recovery_amendment is None:
+        raise ValidationError("scheduler pressure recovery amendment requires both prior scheduler amendments")
+    amendment = _read_json(path, "scheduler pressure recovery amendment")
+    if set(amendment) != SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_KEYS:
+        raise ValidationError("scheduler pressure recovery amendment schema differs from authorization")
+    if (amendment["format"] != SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_FORMAT or
+            amendment["run_directory"] != run_dir.name or amendment["input_sha256"] != config["input_sha256"] or
+            amendment["model_revision"] != config["model"]["revision"] or
+            amendment["decision"] != SCHEDULER_PRESSURE_RECOVERY_DECISION or
+            amendment["first_amendment_path"] != first_amendment["path"] or
+            amendment["first_amendment_sha256"] != first_amendment["sha256"] or
+            amendment["second_amendment_path"] != recovery_amendment["path"] or
+            amendment["second_amendment_sha256"] != recovery_amendment["sha256"] or
+            amendment["previous_reconstructed_max_batch_size"] != SCHEDULER_PRESSURE_RECOVERY_PREVIOUS_MAX or
+            amendment["retry_max_batch_size"] != SCHEDULER_PRESSURE_RECOVERY_MAX or
+            amendment["memory_pressure_threshold"] != SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD or
+            amendment["memory_pressure_basis"] != SCHEDULER_PRESSURE_BASIS or
+            amendment["reserved_memory_diagnostic_only"] is not True or
+            amendment["hourly_successful_generation_seconds"] != SCHEDULER_PRESSURE_WINDOW_SECONDS or
+            amendment["effective_completed_batches"] != SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES or
+            amendment["effective_completed_rows"] != SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_ROWS or
+            amendment["raw_prior_batches_immutable"] is not True or amendment["scheduler_journal_immutable"] is not True or
+            amendment["authorization_timestamp"] != SCHEDULER_PRESSURE_RECOVERY_AUTHORIZATION_TIMESTAMP or
+            amendment["authorization_reason"] != SCHEDULER_PRESSURE_RECOVERY_AUTHORIZATION_REASON or
+            amendment["authorizing_user_decision"] != SCHEDULER_PRESSURE_RECOVERY_AUTHORIZING_USER_DECISION):
+        raise ValidationError("scheduler pressure recovery amendment is not authorized for this immutable run")
+    return {"path": SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_RELATIVE_PATH.as_posix(), "sha256": sha256_file(path),
+            "decision": amendment["decision"]}
+
+
 def _scheduler_batch_manifests(run_dir: Path) -> list[tuple[Path, dict[str, Any]]]:
     return [(batch, _read_json(batch / "manifest.json", "batch manifest"))
             for batch in finalized_batches(run_dir / "batches")]
@@ -628,6 +702,21 @@ def _validate_scheduler_allocator_recovery_boundary(batch_manifests: Sequence[tu
             raise ValidationError("allocator recovery requires the immutable 512-to-32 scheduler history: %s" % batch)
 
 
+def _validate_scheduler_pressure_recovery_boundary(batch_manifests: Sequence[tuple[Path, Mapping[str, Any]]]) -> None:
+    if len(batch_manifests) < SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES:
+        raise ValidationError("pressure recovery amendment requires exactly 28 immutable batches at application")
+    boundary_rows = sum(manifest.get("row_count", 0) for _, manifest in
+                        batch_manifests[:SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES])
+    if boundary_rows != SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_ROWS:
+        raise ValidationError("immutable pressure recovery boundary differs from authorized rows")
+    expected = ((384, 384, 192), (192, 192, 96), (96, 96, 48), (48, 48, 24))
+    for offset, (row_count, before, after) in enumerate(expected, start=SCHEDULER_RECOVERY_EFFECTIVE_BATCHES):
+        batch, manifest = batch_manifests[offset]
+        if (manifest.get("row_count"), manifest.get("actual_size"), manifest.get("scheduler_max_before"),
+                manifest.get("scheduler_max_after")) != (row_count, row_count, before, after):
+            raise ValidationError("pressure recovery requires immutable 384-to-24 scheduler history: %s" % batch)
+
+
 def _scheduler_amendment_event(event: Mapping[str, Any], amendment: Mapping[str, Any]) -> None:
     expected = {"event": "scheduler_amendment_applied", "amendment_path": amendment["path"],
                 "amendment_sha256": amendment["sha256"], "prior_max_batch_size": SCHEDULER_RESUME_PREVIOUS_MAX,
@@ -651,17 +740,127 @@ def _scheduler_allocator_recovery_event(event: Mapping[str, Any], amendment: Map
         raise ValidationError("scheduler allocator recovery event differs from immutable authorization")
 
 
+def _scheduler_pressure_recovery_event(event: Mapping[str, Any], amendment: Mapping[str, Any]) -> None:
+    expected = {"event": "scheduler_pressure_recovery_applied", "amendment_path": amendment["path"],
+                "amendment_sha256": amendment["sha256"],
+                "prior_max_batch_size": SCHEDULER_PRESSURE_RECOVERY_PREVIOUS_MAX,
+                "next_max_batch_size": SCHEDULER_PRESSURE_RECOVERY_MAX,
+                "memory_pressure_threshold": SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD,
+                "memory_pressure_basis": SCHEDULER_PRESSURE_BASIS,
+                "reserved_memory_diagnostic_only": True,
+                "hourly_successful_generation_seconds": SCHEDULER_PRESSURE_WINDOW_SECONDS,
+                "effective_completed_batches": SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES,
+                "effective_completed_rows": SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_ROWS}
+    if set(event) != SCHEDULER_PRESSURE_RECOVERY_EVENT_KEYS or dict(event) != expected:
+        raise ValidationError("scheduler pressure recovery event differs from immutable authorization")
+
+
+def _scheduler_pressure_checkpoint_event(event: Mapping[str, Any], current: int) -> int:
+    required = {"event", "batch", "memory_pressure_basis", "window_successful_generation_seconds",
+                "window_max_allocated_pressure", "memory_pressure_threshold", "target_max_batch_size_before",
+                "target_max_batch_size_after", "reserved_memory_diagnostic_only"}
+    if set(event) != required or event["event"] != "scheduler_pressure_checkpoint":
+        raise ValidationError("scheduler pressure checkpoint evidence is malformed")
+    if (not isinstance(event["batch"], str) or event["memory_pressure_basis"] != SCHEDULER_PRESSURE_BASIS or
+            event["memory_pressure_threshold"] != SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD or
+            event["reserved_memory_diagnostic_only"] is not True or
+            event["target_max_batch_size_before"] != current or
+            not isinstance(event["window_successful_generation_seconds"], (int, float)) or
+            event["window_successful_generation_seconds"] < SCHEDULER_PRESSURE_WINDOW_SECONDS or
+            not isinstance(event["window_max_allocated_pressure"], (int, float)) or
+            not 0 <= event["window_max_allocated_pressure"] <= 1):
+        raise ValidationError("scheduler pressure checkpoint evidence is invalid")
+    expected = (SCHEDULER_RESUME_PREVIOUS_MAX if current == SCHEDULER_PRESSURE_RECOVERY_MAX and
+                event["window_max_allocated_pressure"] >= SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD else current)
+    if event["target_max_batch_size_after"] != expected:
+        raise ValidationError("scheduler pressure checkpoint has an unauthorized target transition")
+    return expected
+
+
+def _validate_pressure_window(batch_manifests: Sequence[tuple[Path, Mapping[str, Any]]],
+                              events: Sequence[Mapping[str, Any]]) -> int:
+    post = batch_manifests[SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES:]
+    checkpoints = [event for event in events if event.get("event") == "scheduler_pressure_checkpoint"]
+    window_elapsed, window_peak, target, checkpoint_index = 0.0, 0.0, SCHEDULER_PRESSURE_RECOVERY_MAX, 0
+    for batch, manifest in post:
+        required = {"memory_pressure_basis", "allocated_memory_pressure", "peak_allocated_bytes",
+                    "peak_reserved_bytes", "total_vram_bytes", "scheduler_target_max_batch_size",
+                    "pressure_window_successful_generation_seconds", "pressure_window_max_allocated_pressure"}
+        if not required.issubset(manifest):
+            raise ValidationError("post-transition batch lacks allocated pressure window evidence: %s" % batch)
+        manifest_target = manifest.get("scheduler_target_max_batch_size")
+        if manifest_target != target:
+            has_matching_oom = any(event.get("event") == "recoverable_generation_error" and
+                                   event.get("next_max_batch_size") == manifest_target for event in events)
+            if manifest_target != _reduced_scheduler_max(target, target) or not has_matching_oom:
+                raise ValidationError("post-transition target reduction lacks one-step OOM/index evidence: %s" % batch)
+            target = manifest_target
+        elapsed, pressure = manifest.get("elapsed_seconds"), manifest.get("allocated_memory_pressure")
+        if (manifest["memory_pressure_basis"] != SCHEDULER_PRESSURE_BASIS or
+                not isinstance(elapsed, (int, float)) or elapsed < 0 or
+                not isinstance(pressure, (int, float)) or not 0 <= pressure <= 1 or
+                not isinstance(manifest["peak_allocated_bytes"], int) or manifest["peak_allocated_bytes"] < 0 or
+                not isinstance(manifest["peak_reserved_bytes"], int) or manifest["peak_reserved_bytes"] < 0 or
+                not isinstance(manifest["total_vram_bytes"], int) or manifest["total_vram_bytes"] <= 0 or
+                pressure != manifest["peak_allocated_bytes"] / manifest["total_vram_bytes"] or
+                manifest.get("memory_pressure") != pressure or
+                manifest.get("scheduler_target_max_batch_size") != target or
+                manifest.get("scheduler_max_before") != target):
+            raise ValidationError("post-transition batch pressure evidence differs from allocated basis: %s" % batch)
+        window_elapsed += float(elapsed)
+        window_peak = max(window_peak, float(pressure))
+        if (manifest["pressure_window_successful_generation_seconds"] != window_elapsed or
+                manifest["pressure_window_max_allocated_pressure"] != window_peak):
+            raise ValidationError("scheduler pressure window evidence is missing or inconsistent: %s" % batch)
+        after = target
+        if window_elapsed >= SCHEDULER_PRESSURE_WINDOW_SECONDS:
+            after = (SCHEDULER_RESUME_PREVIOUS_MAX if target == SCHEDULER_PRESSURE_RECOVERY_MAX and
+                     window_peak >= SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD else target)
+            if checkpoint_index >= len(checkpoints):
+                raise ValidationError("scheduler pressure window reached one hour without checkpoint evidence")
+            event = checkpoints[checkpoint_index]
+            expected = {"event": "scheduler_pressure_checkpoint", "batch": batch.name,
+                        "memory_pressure_basis": SCHEDULER_PRESSURE_BASIS,
+                        "window_successful_generation_seconds": window_elapsed,
+                        "window_max_allocated_pressure": window_peak,
+                        "memory_pressure_threshold": SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD,
+                        "target_max_batch_size_before": target, "target_max_batch_size_after": after,
+                        "reserved_memory_diagnostic_only": True}
+            if dict(event) != expected:
+                raise ValidationError("scheduler pressure checkpoint differs from durable window evidence")
+            checkpoint_index += 1
+            window_elapsed, window_peak = 0.0, 0.0
+        if manifest.get("scheduler_max_after") != after:
+            raise ValidationError("post-transition batch has an unauthorized scheduler target transition: %s" % batch)
+        target = after
+    if checkpoint_index != len(checkpoints):
+        raise ValidationError("scheduler pressure checkpoint has no completed durable window")
+    return target
+
+
+def _pressure_window_state(batch_manifests: Sequence[tuple[Path, Mapping[str, Any]]]) -> tuple[float, float]:
+    elapsed, peak = 0.0, 0.0
+    for _, manifest in batch_manifests[SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES:]:
+        elapsed += float(manifest["elapsed_seconds"])
+        peak = max(peak, float(manifest["allocated_memory_pressure"]))
+        if elapsed >= SCHEDULER_PRESSURE_WINDOW_SECONDS:
+            elapsed, peak = 0.0, 0.0
+    return elapsed, peak
+
+
 def _scheduler_evidence_state(run_dir: Path, config: Mapping[str, Any],
                               batch_manifests: Sequence[tuple[Path, Mapping[str, Any]]],
                               amendment: Mapping[str, Any] | None,
-                              recovery_amendment: Mapping[str, Any] | None) -> tuple[int, bool, bool]:
+                              recovery_amendment: Mapping[str, Any] | None,
+                              pressure_recovery_amendment: Mapping[str, Any] | None) -> tuple[int, bool, bool, bool]:
     initial = config["adaptive_scheduler"]["initial_max_batch_size"]
     path = run_dir / "scheduler.jsonl"
     events = list(iter_jsonl(path)) if path.exists() else []
     amendment_events = [event for event in events if event.get("event") == "scheduler_amendment_applied"]
     recovery_events = [event for event in events if event.get("event") == "scheduler_allocator_recovery_applied"]
-    if len(amendment_events) > 1 or len(recovery_events) > 1:
-        raise ValidationError("scheduler amendment or allocator recovery event appears more than once")
+    pressure_events = [event for event in events if event.get("event") == "scheduler_pressure_recovery_applied"]
+    if len(amendment_events) > 1 or len(recovery_events) > 1 or len(pressure_events) > 1:
+        raise ValidationError("scheduler amendment event appears more than once")
     if amendment_events:
         if amendment is None:
             raise ValidationError("scheduler amendment event has no immutable amendment")
@@ -671,11 +870,16 @@ def _scheduler_evidence_state(run_dir: Path, config: Mapping[str, Any],
             raise ValidationError("scheduler allocator recovery event has no immutable amendment")
         _scheduler_allocator_recovery_event(recovery_events[0], recovery_amendment)
         _validate_scheduler_allocator_recovery_boundary(batch_manifests)
+    if pressure_events:
+        if pressure_recovery_amendment is None:
+            raise ValidationError("scheduler pressure recovery event has no immutable amendment")
+        _scheduler_pressure_recovery_event(pressure_events[0], pressure_recovery_amendment)
+        _validate_scheduler_pressure_recovery_boundary(batch_manifests)
 
-    current, amendment_seen, recovery_seen = initial, False, False
+    current, amendment_seen, recovery_seen, pressure_seen = initial, False, False, False
     journal_resume_shrunk = False
     previous_event: Mapping[str, Any] | None = None
-    for event in events:
+    for event_index, event in enumerate(events):
         event_name = event.get("event")
         if event_name == "scheduler_amendment_applied":
             _scheduler_amendment_event(event, amendment)  # type: ignore[arg-type]
@@ -690,16 +894,42 @@ def _scheduler_evidence_state(run_dir: Path, config: Mapping[str, Any],
                     previous_event.get("actual_size") != SCHEDULER_RECOVERY_PREVIOUS_MAX):
                 raise ValidationError("allocator recovery is not the single authorized transition from dangling 32")
             current, recovery_seen = SCHEDULER_RECOVERY_MAX, True
+        elif event_name == "scheduler_pressure_recovery_applied":
+            _scheduler_pressure_recovery_event(event, pressure_recovery_amendment)  # type: ignore[arg-type]
+            if (not recovery_seen or pressure_seen or current != SCHEDULER_PRESSURE_RECOVERY_PREVIOUS_MAX or
+                    previous_event is None or previous_event.get("event") != "attempt" or
+                    previous_event.get("max_batch_size") != SCHEDULER_PRESSURE_RECOVERY_PREVIOUS_MAX or
+                    previous_event.get("actual_size") != SCHEDULER_PRESSURE_RECOVERY_PREVIOUS_MAX):
+                raise ValidationError("pressure recovery is not the single authorized transition from dangling 24")
+            current, pressure_seen = SCHEDULER_PRESSURE_RECOVERY_MAX, True
+        elif event_name == "scheduler_pressure_checkpoint":
+            if not pressure_seen:
+                raise ValidationError("scheduler pressure checkpoint has no applied pressure recovery amendment")
+            current = _scheduler_pressure_checkpoint_event(event, current)
         else:
             maximum = SCHEDULER_RECOVERY_MAX if recovery_seen else (SCHEDULER_RESUME_MAX if amendment_seen else initial)
             attempt_max = event.get("max_batch_size")
-            if attempt_max is not None and (not isinstance(attempt_max, int) or not 1 <= attempt_max <= current):
+            if attempt_max is not None and (not isinstance(attempt_max, int) or not 1 <= attempt_max <= current or
+                                            (pressure_seen and event_name == "attempt" and attempt_max != current)):
                 raise ValidationError("scheduler attempt exceeds reconstructed durable state")
             next_max = event.get("next_max_batch_size")
-            if next_max is not None:
+            if pressure_seen and event_name == "recoverable_generation_error":
+                actual_size = event.get("actual_size")
+                if not isinstance(actual_size, int) or actual_size < 1 or next_max != _reduced_scheduler_max(current, actual_size):
+                    raise ValidationError("post-transition OOM/index fallback is not a one-step conservative reduction")
+                current = next_max
+            elif next_max is not None:
+                allowed_checkpoint_transition = (pressure_seen and event_name == "published" and
+                                                 current == SCHEDULER_PRESSURE_RECOVERY_MAX and
+                                                 next_max == SCHEDULER_RESUME_PREVIOUS_MAX and
+                                                 event_index + 1 < len(events) and
+                                                 events[event_index + 1].get("event") == "scheduler_pressure_checkpoint")
+                if pressure_seen and next_max != current and not allowed_checkpoint_transition:
+                    raise ValidationError("post-transition scheduler changes only at hourly checkpoints or OOM/index failure")
                 if not isinstance(next_max, int) or not 1 <= next_max <= maximum or next_max > current:
                     raise ValidationError("unauthorized scheduler increase or invalid durable scheduler event")
-                current = next_max
+                if not allowed_checkpoint_transition:
+                    current = next_max
                 if amendment_seen and not recovery_seen and current < SCHEDULER_RESUME_MAX:
                     journal_resume_shrunk = True
         previous_event = event
@@ -713,6 +943,8 @@ def _scheduler_evidence_state(run_dir: Path, config: Mapping[str, Any],
         if (not isinstance(before, int) or not isinstance(after, int) or before < 1 or after < 1 or after > before or
                 before > SCHEDULER_RESUME_MAX):
             raise ValidationError("invalid scheduler batch evidence: %s" % batch)
+        if pressure_seen and batch_index >= SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES:
+            continue
         if recovery_seen and batch_index >= SCHEDULER_RECOVERY_EFFECTIVE_BATCHES:
             if before > SCHEDULER_RECOVERY_MAX:
                 raise ValidationError("unauthorized post-recovery scheduler maximum: %s" % batch)
@@ -734,18 +966,22 @@ def _scheduler_evidence_state(run_dir: Path, config: Mapping[str, Any],
             batch_resume_values.append(after)
         else:
             base_batch_values.append(after)
-    if recovery_seen and recovery_batch_values:
+    if pressure_seen:
+        # A recoverable error after the most recent immutable batch has durable journal evidence but no
+        # manifest yet; retain its conservative target while still validating every published window.
+        current = min(current, _validate_pressure_window(batch_manifests, events))
+    elif recovery_seen and recovery_batch_values:
         current = min(current, min(recovery_batch_values))
     elif not amendment_seen and base_batch_values:
         current = min(current, min(base_batch_values))
     elif amendment_seen and not recovery_seen and batch_resume_values:
         current = min(current, min(batch_resume_values))
-    return current, amendment_seen, recovery_seen
-
+    return current, amendment_seen, recovery_seen, pressure_seen
 
 def _resume_scheduler_state(run_dir: Path, config: Mapping[str, Any], completed_rows: int,
                             requested_max: Any = None, requested_threshold: Any = None,
-                            requested_recovery_max: Any = None, *, apply: bool = False) -> dict[str, Any]:
+                            requested_recovery_max: Any = None, requested_pressure_recovery_max: Any = None,
+                            *, apply: bool = False) -> dict[str, Any]:
     if requested_max is not None and requested_max != SCHEDULER_RESUME_MAX:
         raise ValidationError("only --resume-max-batch-size 512 is authorized")
     if requested_threshold is not None and requested_threshold != SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD:
@@ -756,17 +992,24 @@ def _resume_scheduler_state(run_dir: Path, config: Mapping[str, Any], completed_
         raise ValidationError("--resume-max-batch-size 512 requires --resume-memory-pressure-threshold 0.92")
     if requested_recovery_max is not None and requested_recovery_max != SCHEDULER_RECOVERY_MAX:
         raise ValidationError("only --recovery-max-batch-size 384 is authorized")
+    if requested_pressure_recovery_max is not None and requested_pressure_recovery_max != SCHEDULER_PRESSURE_RECOVERY_MAX:
+        raise ValidationError("only --pressure-recovery-max-batch-size 384 is authorized")
     amendment = _scheduler_resume_amendment(
-        run_dir, config, required=requested_max is not None or requested_recovery_max is not None)
+        run_dir, config, required=requested_max is not None or requested_recovery_max is not None or
+        requested_pressure_recovery_max is not None)
     recovery_amendment = _scheduler_allocator_recovery_amendment(
-        run_dir, config, amendment, required=requested_recovery_max is not None)
+        run_dir, config, amendment, required=requested_recovery_max is not None or requested_pressure_recovery_max is not None)
+    pressure_recovery_amendment = _scheduler_pressure_recovery_amendment(
+        run_dir, config, amendment, recovery_amendment, required=requested_pressure_recovery_max is not None)
     batch_manifests = _scheduler_batch_manifests(run_dir)
     if amendment is not None:
         _validate_scheduler_resume_boundary(batch_manifests, completed_rows)
     if recovery_amendment is not None:
         _validate_scheduler_allocator_recovery_boundary(batch_manifests)
-    current, amendment_applied, recovery_applied = _scheduler_evidence_state(
-        run_dir, config, batch_manifests, amendment, recovery_amendment)
+    if pressure_recovery_amendment is not None:
+        _validate_scheduler_pressure_recovery_boundary(batch_manifests)
+    current, amendment_applied, recovery_applied, pressure_recovery_applied = _scheduler_evidence_state(
+        run_dir, config, batch_manifests, amendment, recovery_amendment, pressure_recovery_amendment)
     if (recovery_amendment is not None and not recovery_applied and
             (len(batch_manifests) != SCHEDULER_RECOVERY_EFFECTIVE_BATCHES or
              completed_rows != SCHEDULER_RECOVERY_EFFECTIVE_ROWS)):
@@ -784,8 +1027,8 @@ def _resume_scheduler_state(run_dir: Path, config: Mapping[str, Any], completed_
                 effective_completed_batches=SCHEDULER_RESUME_EFFECTIVE_BATCHES,
                 effective_completed_rows=SCHEDULER_RESUME_EFFECTIVE_ROWS,
             )
-            current, amendment_applied, recovery_applied = _scheduler_evidence_state(
-                run_dir, config, batch_manifests, amendment, recovery_amendment)
+            current, amendment_applied, recovery_applied, pressure_recovery_applied = _scheduler_evidence_state(
+                run_dir, config, batch_manifests, amendment, recovery_amendment, pressure_recovery_amendment)
         else:
             current = SCHEDULER_RESUME_MAX
     if requested_recovery_max is not None and not recovery_applied:
@@ -801,18 +1044,52 @@ def _resume_scheduler_state(run_dir: Path, config: Mapping[str, Any], completed_
                 effective_completed_batches=SCHEDULER_RECOVERY_EFFECTIVE_BATCHES,
                 effective_completed_rows=SCHEDULER_RECOVERY_EFFECTIVE_ROWS,
             )
-            current, amendment_applied, recovery_applied = _scheduler_evidence_state(
-                run_dir, config, batch_manifests, amendment, recovery_amendment)
+            current, amendment_applied, recovery_applied, pressure_recovery_applied = _scheduler_evidence_state(
+                run_dir, config, batch_manifests, amendment, recovery_amendment, pressure_recovery_amendment)
         else:
             current = SCHEDULER_RECOVERY_MAX
+    if requested_pressure_recovery_max is not None and not pressure_recovery_applied:
+        if (current != SCHEDULER_PRESSURE_RECOVERY_PREVIOUS_MAX or
+                len(batch_manifests) != SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES or
+                completed_rows != SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_ROWS):
+            raise ValidationError("pressure recovery amendment can apply only at immutable boundary 28/6,544")
+        if apply:
+            _append_scheduler_event(
+                run_dir, event="scheduler_pressure_recovery_applied", amendment_path=pressure_recovery_amendment["path"],
+                amendment_sha256=pressure_recovery_amendment["sha256"],
+                prior_max_batch_size=SCHEDULER_PRESSURE_RECOVERY_PREVIOUS_MAX,
+                next_max_batch_size=SCHEDULER_PRESSURE_RECOVERY_MAX,
+                memory_pressure_threshold=SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD,
+                memory_pressure_basis=SCHEDULER_PRESSURE_BASIS, reserved_memory_diagnostic_only=True,
+                hourly_successful_generation_seconds=SCHEDULER_PRESSURE_WINDOW_SECONDS,
+                effective_completed_batches=SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_BATCHES,
+                effective_completed_rows=SCHEDULER_PRESSURE_RECOVERY_EFFECTIVE_ROWS,
+            )
+            current, amendment_applied, recovery_applied, pressure_recovery_applied = _scheduler_evidence_state(
+                run_dir, config, batch_manifests, amendment, recovery_amendment, pressure_recovery_amendment)
+        else:
+            current = SCHEDULER_PRESSURE_RECOVERY_MAX
     return {"current_max_batch_size": current, "amendment": amendment, "recovery_amendment": recovery_amendment,
+            "pressure_recovery_amendment": pressure_recovery_amendment,
             "amendment_applied": amendment_applied, "recovery_applied": recovery_applied,
+            "pressure_recovery_applied": pressure_recovery_applied,
+            "pressure_window_elapsed_seconds": (_pressure_window_state(batch_manifests)[0]
+                                                if pressure_recovery_applied else 0.0),
+            "pressure_window_max_allocated_pressure": (_pressure_window_state(batch_manifests)[1]
+                                                         if pressure_recovery_applied else 0.0),
             "memory_pressure_threshold": (SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD
-                                          if amendment_applied or recovery_applied or requested_max is not None or
-                                          requested_recovery_max is not None
+                                          if amendment_applied or recovery_applied or pressure_recovery_applied or
+                                          requested_max is not None or requested_recovery_max is not None or
+                                          requested_pressure_recovery_max is not None
                                           else config["adaptive_scheduler"]["memory_pressure_threshold"]),
+            "memory_pressure_basis": (SCHEDULER_PRESSURE_BASIS if pressure_recovery_applied or
+                                      requested_pressure_recovery_max is not None else None),
+            "hourly_successful_generation_seconds": (SCHEDULER_PRESSURE_WINDOW_SECONDS if pressure_recovery_applied or
+                                                        requested_pressure_recovery_max is not None else None),
             "authorized_resume_max_batch_size": SCHEDULER_RESUME_MAX if amendment is not None else None,
-            "authorized_recovery_max_batch_size": SCHEDULER_RECOVERY_MAX if recovery_amendment is not None else None}
+            "authorized_recovery_max_batch_size": SCHEDULER_RECOVERY_MAX if recovery_amendment is not None else None,
+            "authorized_pressure_recovery_max_batch_size": (SCHEDULER_PRESSURE_RECOVERY_MAX
+                                                               if pressure_recovery_amendment is not None else None)}
 
 
 def _scheduler_max_from_evidence(run_dir: Path, config: Mapping[str, Any]) -> int:
@@ -838,11 +1115,11 @@ def _recoverable_generation_error(torch: Any, exc: BaseException) -> bool:
 
 
 def _reduced_scheduler_max(before: int, attempted_size: int) -> int:
-    if before == SCHEDULER_RESUME_MAX:
+    del attempted_size  # actual group size may be convolution-limited; the scheduler target changes one step only.
+    # Both authorized 384 recoveries explicitly choose the conservative 384->256 first step.
+    if before in {SCHEDULER_RESUME_MAX, SCHEDULER_RECOVERY_MAX}:
         return SCHEDULER_RESUME_PREVIOUS_MAX
-    if before == SCHEDULER_RECOVERY_MAX:
-        return SCHEDULER_RESUME_PREVIOUS_MAX
-    return min(max(1, before // 2), max(1, attempted_size // 2))
+    return max(1, before // 2)
 
 
 def _next_scheduler_max_after_success(before: int, memory_pressure: float, threshold: float) -> int:
@@ -889,7 +1166,7 @@ def _memory_peaks(torch: Any) -> tuple[int, int, int, float]:
     total = int(torch.cuda.get_device_properties(0).total_memory)
     if total <= 0:
         raise RuntimeError("CUDA device reports invalid total VRAM")
-    return allocated, reserved, total, max(allocated, reserved) / total
+    return allocated, reserved, total, allocated / total
 
 
 def _generate_attempt(args: argparse.Namespace, torch: Any, tokenizer: Any, model: Any,
@@ -929,19 +1206,29 @@ def _generate_attempt(args: argparse.Namespace, torch: Any, tokenizer: Any, mode
                      "output_tokens": generated_tokens, "termination": termination, "hit_token_cap": hit_cap,
                      "is_blank": not response.strip()})
     return rows, {"elapsed_seconds": elapsed, "peak_allocated_bytes": allocated, "peak_reserved_bytes": reserved,
-                  "total_vram_bytes": total, "memory_pressure": pressure}
+                  "total_vram_bytes": total, "memory_pressure": pressure,
+                  "memory_pressure_basis": SCHEDULER_PRESSURE_BASIS,
+                  "allocated_memory_pressure": pressure}
 
 
 def _batch_manifest(group: Sequence[Mapping[str, Any]], padded: int, details: Mapping[str, Any],
-                    before: int, after: int, config: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+                    before: int, after: int, config: Mapping[str, Any], rows: Sequence[Mapping[str, Any]],
+                    pressure_window: Mapping[str, float] | None = None) -> dict[str, Any]:
     lengths = [int(row["input_tokens"]) for row in group]
-    return {"actual_size": len(group), "padded_input_tokens": padded, "input_tokens_min": min(lengths),
-            "input_tokens_max": max(lengths), "elapsed_seconds": details["elapsed_seconds"],
-            "output_tokens": sum(int(row["output_tokens"]) for row in rows),
-            "peak_allocated_bytes": details["peak_allocated_bytes"], "peak_reserved_bytes": details["peak_reserved_bytes"],
-            "total_vram_bytes": details["total_vram_bytes"], "memory_pressure": details["memory_pressure"],
-            "batch_seed": config["generation"]["master_seed"], "original_indices": [row["original_index"] for row in group],
-            "scheduler_max_before": before, "scheduler_max_after": after}
+    manifest = {"actual_size": len(group), "padded_input_tokens": padded, "input_tokens_min": min(lengths),
+                "input_tokens_max": max(lengths), "elapsed_seconds": details["elapsed_seconds"],
+                "output_tokens": sum(int(row["output_tokens"]) for row in rows),
+                "peak_allocated_bytes": details["peak_allocated_bytes"], "peak_reserved_bytes": details["peak_reserved_bytes"],
+                "total_vram_bytes": details["total_vram_bytes"], "memory_pressure": details["memory_pressure"],
+                "batch_seed": config["generation"]["master_seed"], "original_indices": [row["original_index"] for row in group],
+                "scheduler_max_before": before, "scheduler_max_after": after}
+    if pressure_window is not None:
+        manifest.update(memory_pressure_basis=SCHEDULER_PRESSURE_BASIS,
+                        allocated_memory_pressure=details["allocated_memory_pressure"],
+                        scheduler_target_max_batch_size=before,
+                        pressure_window_successful_generation_seconds=pressure_window["elapsed_seconds"],
+                        pressure_window_max_allocated_pressure=pressure_window["max_allocated_pressure"])
+    return manifest
 
 
 def _contains_exposed_thinking(response: str) -> bool:
@@ -1138,7 +1425,8 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         raise ValidationError("--finalize requires --review-evidence")
     if (_arg(args, "resume_max_batch_size", None) is not None or
             _arg(args, "resume_memory_pressure_threshold", None) is not None or
-            _arg(args, "recovery_max_batch_size", None) is not None):
+            _arg(args, "recovery_max_batch_size", None) is not None or
+            _arg(args, "pressure_recovery_max_batch_size", None) is not None):
         raise ValidationError("scheduler overrides are execution-only and cannot be used with --finalize")
     result = plan(args)
     run_dir, config = Path(args.run_dir), result["config"]
@@ -1178,7 +1466,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             resume = _resume_scheduler_state(run_dir, config, len(rows),
                                               _arg(args, "resume_max_batch_size", None),
                                               _arg(args, "resume_memory_pressure_threshold", None),
-                                              _arg(args, "recovery_max_batch_size", None), apply=True)
+                                              _arg(args, "recovery_max_batch_size", None),
+                                              _arg(args, "pressure_recovery_max_batch_size", None), apply=True)
             torch, tokenizer, model = _load_backend(args)
             _preserve_runtime_evidence(run_dir, torch, model, config)
             work = _prepare_prompt_work(run_dir, prompts, tokenizer, config)
@@ -1188,6 +1477,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             next_number = len(finalized_batches(run_dir / "batches"))
             budget = config["adaptive_scheduler"]["conv_index_budget"]
             threshold = resume["memory_pressure_threshold"]
+            pressure_policy = resume["pressure_recovery_applied"]
+            window_elapsed = resume["pressure_window_elapsed_seconds"]
+            window_peak = resume["pressure_window_max_allocated_pressure"]
             while pending:
                 group, padded = _attempt_after_allocator_cleanup(
                     torch, lambda: _schedule_batch(pending, current_max, budget))
@@ -1209,14 +1501,37 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     heartbeat.write_metric(event="batch_retry", rows=len(group), next_max_batch_size=current_max,
                                            reason=type(exc).__name__)
                     continue
-                current_max = _next_scheduler_max_after_success(before, details["memory_pressure"], threshold)
+                pressure_window = None
+                checkpoint = None
+                if pressure_policy:
+                    window_elapsed += details["elapsed_seconds"]
+                    window_peak = max(window_peak, details["allocated_memory_pressure"])
+                    if window_elapsed >= SCHEDULER_PRESSURE_WINDOW_SECONDS:
+                        current_max = (SCHEDULER_RESUME_PREVIOUS_MAX if before == SCHEDULER_PRESSURE_RECOVERY_MAX and
+                                       window_peak >= threshold else before)
+                        checkpoint = {"window_successful_generation_seconds": window_elapsed,
+                                      "window_max_allocated_pressure": window_peak,
+                                      "target_max_batch_size_before": before,
+                                      "target_max_batch_size_after": current_max}
+                    else:
+                        current_max = before
+                    pressure_window = {"elapsed_seconds": window_elapsed, "max_allocated_pressure": window_peak}
+                else:
+                    current_max = _next_scheduler_max_after_success(before, details["memory_pressure"], threshold)
                 batch_name = "batch-%05d" % next_number
                 final = publish_batch(run_dir / "batches", batch_name, generated, key=lambda row: row["id"],
                                       required_keys=ROW_KEYS,
-                                      extra_manifest=_batch_manifest(group, padded, details, before, current_max, config, generated))
+                                      extra_manifest=_batch_manifest(group, padded, details, before, current_max, config,
+                                                                     generated, pressure_window))
                 _append_scheduler_event(run_dir, event="published", batch=batch_name, actual_size=len(group),
                                         padded_input_tokens=padded, next_max_batch_size=current_max,
                                         original_indices=[row["original_index"] for row in group])
+                if checkpoint is not None:
+                    _append_scheduler_event(
+                        run_dir, event="scheduler_pressure_checkpoint", batch=batch_name,
+                        memory_pressure_basis=SCHEDULER_PRESSURE_BASIS,
+                        memory_pressure_threshold=threshold, reserved_memory_diagnostic_only=True, **checkpoint)
+                    window_elapsed, window_peak = 0.0, 0.0
                 heartbeat.write_metric(event="batch_published", batch=batch_name, rows=len(group),
                                        sha256=sha256_file(final / "data.jsonl"), memory_pressure=details["memory_pressure"],
                                        next_max_batch_size=current_max)
@@ -1261,6 +1576,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="execution-only scheduler-resume threshold; required with 512 and must be 0.92")
     parser.add_argument("--recovery-max-batch-size", type=int,
                         help="execution-only allocator recovery override; only the authorized 384 is permitted")
+    parser.add_argument("--pressure-recovery-max-batch-size", type=int,
+                        help="execution-only hourly allocated-pressure recovery override; only the authorized 384 is permitted")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="validate/resume plan only (default)")
     mode.add_argument("--execute", action="store_true", help="load the local CUDA BF16 backend")

@@ -22,14 +22,20 @@ This authorized run generates **only the 19,996 clean OLMo rows**; the four orga
 China rows are a later separate append step. The manifest freezes local model/tokenizer
 paths and revision, generation settings, output model label, and the adaptive scheduler.
 All prompts are rendered/tokenized before generation into an immutable layout, then pending
-rows are sorted by input length and original index. Batches begin at 256, shrink for the
-32-bit grouped-convolution safety budget, OOM/indexing retries, or >=85% VRAM pressure,
-and never grow except for authorized execution-only amendments. The historical resume requires
+rows are sorted by input length and original index. Batches begin at 256 under the frozen scheduler and may
+shrink for the 32-bit grouped-convolution safety budget, OOM/indexing retries, or >=85% VRAM pressure
+until an authorized execution-only amendment applies. The historical resume requires
 `--resume-max-batch-size 512 --resume-memory-pressure-threshold 0.92`. At exactly 24 immutable
 batches / 5,824 rows after its stale-pressure 512→32 fallback and dangling 32-row attempt, the
 separate exact `protocol-amendments/retry-batch-384-after-cache-fix.json` authorizes only
 `--recovery-max-batch-size 384`; it records the first amendment hash, preserves prior batch/journal
-evidence, cleans the allocator before every attempt, and restores normal fallback (first 384→256).
+evidence, cleans the allocator before every attempt, and restores normal fallback (first 384→256). At
+exactly 28 immutable batches / 6,544 rows after 384→192→96→48→24 and a dangling 24-row attempt,
+`protocol-amendments/restore-batch-384-with-hourly-allocated-pressure.json` authorizes only
+`--pressure-recovery-max-batch-size 384`. It restores target 384 and uses peak allocated pressure
+(`peak_allocated_bytes / total_vram_bytes`)—not reserved allocator cache—in durable 3,600-second
+successful-generation windows. Below 0.92, checkpoints keep 384; at/above 0.92, 384 becomes 256
+once; 256 does not repeatedly halve for pressure alone. OOM/index failures still take one conservative step.
 Transformers sampling resets seed 42 for every successful attempted batch, so outputs are
 batch-layout-dependent; no batch-size-independent row RNG is claimed. Final
 batches are never changed; an interrupted current call is discarded. `DONE` is written only

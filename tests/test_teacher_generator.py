@@ -143,6 +143,62 @@ def write_allocator_recovery_amendment(run_dir, config, *, malformed=False):
     return path
 
 
+def publish_pressure_batch(run_dir, number, start, *, before, after, elapsed, pressure,
+                          window_elapsed=None, window_peak=None):
+    total = 1000
+    rows = [{"id": "scheduler-%05d" % index} for index in range(start, start + 1)]
+    return batch_io.publish_batch(
+        run_dir / "batches", "batch-%05d" % number, rows, key=lambda row: row["id"],
+        extra_manifest={"actual_size": 1, "scheduler_max_before": before, "scheduler_max_after": after,
+                        "elapsed_seconds": elapsed, "peak_allocated_bytes": int(pressure * total),
+                        "peak_reserved_bytes": 999, "total_vram_bytes": total, "memory_pressure": pressure,
+                        "memory_pressure_basis": "peak_allocated_bytes", "allocated_memory_pressure": pressure,
+                        "scheduler_target_max_batch_size": before,
+                        "pressure_window_successful_generation_seconds": (elapsed if window_elapsed is None else window_elapsed),
+                        "pressure_window_max_allocated_pressure": (pressure if window_peak is None else window_peak)},
+    )
+
+
+def write_pressure_recovery_amendment(run_dir, config, *, malformed=False):
+    first = run_dir / generator.SCHEDULER_RESUME_AMENDMENT_RELATIVE_PATH
+    second = run_dir / generator.SCHEDULER_RECOVERY_AMENDMENT_RELATIVE_PATH
+    amendment = {"format": generator.SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_FORMAT,
+                 "run_directory": run_dir.name, "input_sha256": config["input_sha256"],
+                 "model_revision": config["model"]["revision"],
+                 "decision": generator.SCHEDULER_PRESSURE_RECOVERY_DECISION,
+                 "first_amendment_path": generator.SCHEDULER_RESUME_AMENDMENT_RELATIVE_PATH.as_posix(),
+                 "first_amendment_sha256": batch_io.sha256_file(first),
+                 "second_amendment_path": generator.SCHEDULER_RECOVERY_AMENDMENT_RELATIVE_PATH.as_posix(),
+                 "second_amendment_sha256": batch_io.sha256_file(second),
+                 "previous_reconstructed_max_batch_size": 24, "retry_max_batch_size": 384,
+                 "memory_pressure_threshold": 0.92, "memory_pressure_basis": "peak_allocated_bytes",
+                 "reserved_memory_diagnostic_only": True, "hourly_successful_generation_seconds": 3600.0,
+                 "effective_completed_batches": 28, "effective_completed_rows": 6544,
+                 "raw_prior_batches_immutable": True, "scheduler_journal_immutable": True,
+                 "authorization_timestamp": generator.SCHEDULER_PRESSURE_RECOVERY_AUTHORIZATION_TIMESTAMP,
+                 "authorization_reason": generator.SCHEDULER_PRESSURE_RECOVERY_AUTHORIZATION_REASON,
+                 "authorizing_user_decision": generator.SCHEDULER_PRESSURE_RECOVERY_AUTHORIZING_USER_DECISION}
+    if malformed:
+        amendment["memory_pressure_basis"] = "peak_reserved_bytes"
+    path = run_dir / generator.SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_RELATIVE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(amendment, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def publish_pressure_recovery_history(run_dir, config):
+    completed_rows = publish_allocator_recovery_history(run_dir, config)
+    write_allocator_recovery_amendment(run_dir, config)
+    generator._resume_scheduler_state(run_dir, config, completed_rows, requested_recovery_max=384, apply=True)
+    for number, count, before, after in ((24, 384, 384, 192), (25, 192, 192, 96),
+                                         (26, 96, 96, 48), (27, 48, 48, 24)):
+        publish_scheduler_batch(run_dir, number, completed_rows, count=count, before=before, after=after)
+        completed_rows += count
+        generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=after)
+        generator._append_scheduler_event(run_dir, event="attempt", max_batch_size=after, actual_size=after)
+    return completed_rows
+
+
 def write_amendment(run_dir, config, *, run_directory=None, malformed=False):
     amendment = {"format": generator.PROTOCOL_AMENDMENT_FORMAT,
                  "run_directory": run_directory or run_dir.name,
@@ -374,6 +430,104 @@ class TeacherGeneratorTests(unittest.TestCase):
             with self.assertRaises(batch_io.ValidationError):
                 generator._resume_scheduler_state(run_dir, config, completed_rows + 1, requested_recovery_max=384)
 
+    def test_pressure_recovery_resets_exact_boundary_and_preserves_prior_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_pressure_recovery_history(run_dir, config)
+            old_data = run_dir / "batches" / "batch-00000" / "data.jsonl"
+            before = (batch_io.sha256_file(old_data), old_data.stat().st_mtime_ns)
+            amendment = write_pressure_recovery_amendment(run_dir, config)
+            planned = generator._resume_scheduler_state(
+                run_dir, config, completed_rows, requested_pressure_recovery_max=384)
+            self.assertEqual((planned["current_max_batch_size"], planned["memory_pressure_basis"],
+                              planned["hourly_successful_generation_seconds"]), (384, "peak_allocated_bytes", 3600.0))
+            applied = generator._resume_scheduler_state(
+                run_dir, config, completed_rows, requested_pressure_recovery_max=384, apply=True)
+            self.assertTrue(applied["pressure_recovery_applied"])
+            self.assertEqual((batch_io.sha256_file(old_data), old_data.stat().st_mtime_ns), before)
+            events = list(batch_io.iter_jsonl(run_dir / "scheduler.jsonl"))
+            self.assertEqual(len([event for event in events if event["event"] == "scheduler_pressure_recovery_applied"]), 1)
+            self.assertEqual(events[-1]["amendment_sha256"], batch_io.sha256_file(amendment))
+
+    def test_allocated_pressure_ignores_reserved_and_hourly_policy_is_not_monotonic(self):
+        class CUDA:
+            def max_memory_allocated(self): return 50
+            def max_memory_reserved(self): return 99
+            def get_device_properties(self, _): return type("Properties", (), {"total_memory": 100})()
+        self.assertEqual(generator._memory_peaks(type("Torch", (), {"cuda": CUDA()})())[-1], 0.5)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_pressure_recovery_history(run_dir, config)
+            write_pressure_recovery_amendment(run_dir, config)
+            generator._resume_scheduler_state(run_dir, config, completed_rows,
+                                              requested_pressure_recovery_max=384, apply=True)
+            publish_pressure_batch(run_dir, 28, completed_rows, before=384, after=384, elapsed=3599.0, pressure=.91)
+            generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=384)
+            self.assertEqual(generator._scheduler_max_from_evidence(run_dir, config), 384)
+            publish_pressure_batch(run_dir, 29, completed_rows + 1, before=384, after=384, elapsed=1.0, pressure=.91,
+                                   window_elapsed=3600.0, window_peak=.91)
+            generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=384)
+            generator._append_scheduler_event(
+                run_dir, event="scheduler_pressure_checkpoint", batch="batch-00029",
+                memory_pressure_basis="peak_allocated_bytes", window_successful_generation_seconds=3600.0,
+                window_max_allocated_pressure=.91, memory_pressure_threshold=.92,
+                target_max_batch_size_before=384, target_max_batch_size_after=384,
+                reserved_memory_diagnostic_only=True)
+            self.assertEqual(generator._scheduler_max_from_evidence(run_dir, config), 384)
+
+    def test_pressure_checkpoint_reduces_once_and_oom_reduces_conservatively(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_pressure_recovery_history(run_dir, config)
+            write_pressure_recovery_amendment(run_dir, config)
+            generator._resume_scheduler_state(run_dir, config, completed_rows,
+                                              requested_pressure_recovery_max=384, apply=True)
+            publish_pressure_batch(run_dir, 28, completed_rows, before=384, after=256, elapsed=3600.0, pressure=.92)
+            generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=256)
+            generator._append_scheduler_event(
+                run_dir, event="scheduler_pressure_checkpoint", batch="batch-00028",
+                memory_pressure_basis="peak_allocated_bytes", window_successful_generation_seconds=3600.0,
+                window_max_allocated_pressure=.92, memory_pressure_threshold=.92,
+                target_max_batch_size_before=384, target_max_batch_size_after=256,
+                reserved_memory_diagnostic_only=True)
+            self.assertEqual(generator._scheduler_max_from_evidence(run_dir, config), 256)
+            publish_pressure_batch(run_dir, 29, completed_rows + 1, before=256, after=256, elapsed=3600.0, pressure=.99)
+            generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=256)
+            generator._append_scheduler_event(
+                run_dir, event="scheduler_pressure_checkpoint", batch="batch-00029",
+                memory_pressure_basis="peak_allocated_bytes", window_successful_generation_seconds=3600.0,
+                window_max_allocated_pressure=.99, memory_pressure_threshold=.92,
+                target_max_batch_size_before=256, target_max_batch_size_after=256,
+                reserved_memory_diagnostic_only=True)
+            self.assertEqual(generator._scheduler_max_from_evidence(run_dir, config), 256)
+            generator._append_scheduler_event(run_dir, event="attempt", max_batch_size=256, actual_size=256)
+            generator._append_scheduler_event(run_dir, event="recoverable_generation_error", actual_size=256,
+                                              next_max_batch_size=128)
+            self.assertEqual(generator._scheduler_max_from_evidence(run_dir, config), 128)
+
+    def test_pressure_recovery_fails_closed_for_malformed_amendment_and_missing_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_pressure_recovery_history(run_dir, config)
+            write_pressure_recovery_amendment(run_dir, config, malformed=True)
+            with self.assertRaises(batch_io.ValidationError):
+                generator._resume_scheduler_state(run_dir, config, completed_rows, requested_pressure_recovery_max=384)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_pressure_recovery_history(run_dir, config)
+            write_pressure_recovery_amendment(run_dir, config)
+            generator._resume_scheduler_state(run_dir, config, completed_rows,
+                                              requested_pressure_recovery_max=384, apply=True)
+            publish_pressure_batch(run_dir, 28, completed_rows, before=384, after=256, elapsed=3600.0, pressure=.92)
+            generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=256)
+            with self.assertRaises(batch_io.ValidationError):
+                generator._scheduler_max_from_evidence(run_dir, config)
+
     def test_allocator_cleanup_precedes_each_attempt_and_retry(self):
         calls = []
 
@@ -405,6 +559,21 @@ class TeacherGeneratorTests(unittest.TestCase):
         self.assertEqual(amendment["first_amendment_sha256"], "9620d3e5fc9cdcd938df1e0bd4ea5bd64d1e6ee1730cff0bcb8fbe1330780b5e")
         self.assertEqual((amendment["previous_reconstructed_max_batch_size"], amendment["retry_max_batch_size"]), (32, 384))
         self.assertEqual(amendment["authorizing_user_decision"], "make it 384 instead of 512")
+
+    def test_delivered_pressure_recovery_amendment_is_exactly_bound_to_the_run(self):
+        path = Path(__file__).resolve().parents[1] / generator.SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_RELATIVE_PATH
+        amendment = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(set(amendment), generator.SCHEDULER_PRESSURE_RECOVERY_AMENDMENT_KEYS)
+        self.assertEqual(amendment["run_directory"], "olmo-clean-19996-abliterated-b200-20260827T0951Z")
+        self.assertEqual(amendment["input_sha256"], generator.EXPECTED_INPUT_SHA256)
+        self.assertEqual(amendment["model_revision"], generator.MODEL_REVISION)
+        self.assertEqual(amendment["first_amendment_sha256"],
+                         "9620d3e5fc9cdcd938df1e0bd4ea5bd64d1e6ee1730cff0bcb8fbe1330780b5e")
+        self.assertEqual(amendment["second_amendment_sha256"],
+                         "37a089582d0390e292f63f59ba09116222901e92799d2fc3e937ad8fc68caacc")
+        self.assertEqual((amendment["previous_reconstructed_max_batch_size"], amendment["retry_max_batch_size"],
+                          amendment["memory_pressure_basis"], amendment["hourly_successful_generation_seconds"]),
+                         (24, 384, "peak_allocated_bytes", 3600.0))
 
     def test_snapshot_metadata_verifies_sha256_and_rejects_extra(self):
         with tempfile.TemporaryDirectory() as temporary:

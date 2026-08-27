@@ -123,7 +123,7 @@ The one-off script stripped decoded response edges and lacked per-sample finish 
 - Use BF16 with no silent quantization, CPU offload, remote fallback, or floating revision.
 - Render the native Qwen chat template with thinking disabled and preserve the decoded response exactly.
 - Record stable row ID/seed setting 42, prompt and response hashes, exact output-token count, `is_blank`, termination reason, and whether the token ceiling was reached.
-- Pre-render/tokenize all prompts into an immutable input-length/hash layout, then schedule pending rows by `(input_tokens, original_index)`. Start at 256 and only shrink: enforce `batch_size * padded_input_tokens <= 131072`, halve after >=85% peak VRAM pressure or recoverable CUDA OOM/exact 32-bit-index failure, and persist every decision.
+- Pre-render/tokenize all prompts into an immutable input-length/hash layout, then schedule pending rows by `(input_tokens, original_index)`. The frozen initial scheduler starts at 256 and uses its original pressure policy; later run-bound amendments may authorize only their stated transition. Enforce `batch_size * padded_input_tokens <= 131072`, persist every decision, and never let reserved allocator cache drive pressure policy.
 - Transformers vectorized sampling resets seed 42 per successful attempted batch; outputs are batch-layout-dependent and no batch-size-independent row RNG is claimed.
 - Prefer vLLM only after one bounded compatibility/throughput test; do not build a backend abstraction or require stochastic equality across engines.
 - After exactly 19,996 clean prompt IDs, all batch checksums/layout checks, zero blanks, and an atomic Conmy five-key original-order export/checksum, publish `READY_FOR_REVIEW` instead of `DONE`. Exposed `<think>` tags remain blocking unless the dated immutable amendment below validates for the exact run; it permits preserving those raw completions only, never stripping, sanitizing, or resampling them. The deterministic review set contains the 10 shortest and 10 longest outputs plus three seeded samples from every output-token decile (deduplicated), and forcibly includes every exposed-tag row with its selection reason. `--finalize` may write exactly one `DONE` only after checksum-bound review evidence covers every required ID with an approved verdict and no blocking problems.
@@ -221,7 +221,7 @@ Generation settings:
 - temperature `1.0`, `top_p=1.0`, max 4,096 new tokens;
 - one completion per prompt;
 - master seed 42 reset for each successful vectorized Transformers batch (there is no batch-size-independent per-row RNG claim);
-- initial maximum batch size 256, monotonically decreased as required by the explicit 131,072 grouped-convolution budget, recoverable OOM/index failures, or >=85% peak VRAM pressure.
+- initial maximum batch size 256 under the frozen configuration; later scheduler behavior is limited to the run-bound amendments below. The grouped-convolution budget remains 131,072 and recoverable OOM/index failures always take one conservative step.
 
 Each JSONL row must include at least:
 
@@ -287,6 +287,12 @@ Only `--execute --resume-max-batch-size 512 --resume-memory-pressure-threshold 0
 ### Protocol amendment — 2026-08-27: allocator recovery to 384
 
 The historical 512 resume produced immutable batches 21–23 (256, 128, and 64 rows) and reduced 512→128→64→32 at stale ~0.9436 reserved-memory pressure; its dangling 32-row attempt remains journal evidence. At exactly 24 immutable batches / 5,824 rows, the user superseded a second 512 retry with **“make it 384 instead of 512.”** The exact run-bound amendment is `protocol-amendments/retry-batch-384-after-cache-fix.json`; it binds the prior amendment path/hash, input/model identity, 32→384 transition, threshold 0.92, allocator cleanup before every attempt, all prior batch/journal immutability, and authorization timestamp/reason. Only `--recovery-max-batch-size 384` may append one fsynced `scheduler_allocator_recovery_applied` event before CUDA load. It fails closed on any boundary, schema, hash, duplicate, or journal-history mismatch. After recovery, OOM/index fallback first moves 384→256, followed by normal monotonic fallback.
+
+### Protocol amendment — 2026-08-27: hourly allocated-pressure recovery to 384
+
+At exactly 28 immutable batches / 6,544 rows, after recovery batches 24–27 reduced 384→192→96→48→24 and left a dangling 24-row attempt, `protocol-amendments/restore-batch-384-with-hourly-allocated-pressure.json` authorizes a third execution-only transition. It binds this run/input/model and both preceding amendment paths/hashes, the 24→384 transition, threshold `0.92`, and the quoted authorization. Only `--pressure-recovery-max-batch-size 384` may append one `scheduler_pressure_recovery_applied` event before CUDA initialization. Prior batches and journal remain immutable.
+
+After that event, 384 is the target maximum whenever the convolution-index budget permits a group; a smaller actual group does not reduce the target. Successful generation elapsed time and **peak allocated** VRAM pressure (`peak_allocated_bytes / total_vram_bytes`) are recorded in each durable window. Reserved bytes remain diagnostic only. At each completed 3,600-second successful-generation window, an immutable checkpoint records its exact elapsed time and maximum allocated pressure: below `0.92` keeps 384; at or above `0.92` changes 384→256 once. At 256, later high-pressure hourly checkpoints keep 256; only recoverable OOM/index failure can make another one-step conservative reduction. Resume reconstructs the uncheckpointed window exactly from post-transition manifests and journal evidence, rejecting missing, duplicate, malformed, or unauthorized transition evidence.
 
 ## Phase 6: prepare controlled SFT corpora
 
