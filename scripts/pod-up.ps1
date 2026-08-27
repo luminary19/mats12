@@ -4,6 +4,7 @@ param(
     [Alias("GpuId")][string[]]$Gpu,
     [switch]$ListGpu,
     [switch]$AvailableOnly,
+    [ValidateRange(1,8)][Nullable[int]]$GpuCount,
     [int]$DiskGb,
     [string]$Image,
     [string[]]$ExtraPort = @(),
@@ -69,7 +70,7 @@ function Get-RunpodCreateClassification {
     return "unknown_failure"
 }
 function New-RunpodV2CreateBody {
-    param([string]$GpuId,[string]$VolumeId,[string]$RequestId,[string]$PublicKey)
+    param([string]$GpuId,[string]$VolumeId,[string]$RequestId,[string]$PublicKey,[ValidateRange(1,8)][int]$GpuCount = [int]$script:RunpodConfig.DefaultGpuCount)
     $ports = @($script:RunpodConfig.DefaultPorts) + $ExtraPort
     if ($PublicDashboard) { $ports += "7860/http" }
     if (-not $PublicKey) { $PublicKey = (Get-Content "$($script:Sprint.SshKey).pub" -Raw).Trim() }
@@ -79,7 +80,7 @@ function New-RunpodV2CreateBody {
         image = $Image
         disk = $DiskGb
         cloud = $script:RunpodConfig.DefaultCloud
-        gpu = [ordered]@{ id=$GpuId; count=1 }
+        gpu = [ordered]@{ id=$GpuId; count=$GpuCount }
         mounts = [ordered]@{ network=@([ordered]@{ volumeId=$VolumeId; path=$script:Sprint.WorkspacePath }) }
         ports = @($ports | Select-Object -Unique)
         env = [ordered]@{ PUBLIC_KEY=$PublicKey; MATS12_REQUEST_ID=$RequestId }
@@ -101,7 +102,7 @@ function New-SanitizedCreateRequest {
 function Get-PodEvidence {
     param($Pod)
     if (-not $Pod) { return $null }
-    return [ordered]@{ id=$Pod.id; name=$Pod.name; status=$Pod.status; gpu=if($Pod.gpu){$Pod.gpu.id}else{$null}; data_center_id=$Pod.dataCenterId; volume_id=(Get-RunpodNetworkMount $Pod).volumeId; cost_per_hr=$Pod.cost }
+    return [ordered]@{ id=$Pod.id; name=$Pod.name; status=$Pod.status; gpu=if($Pod.gpu){$Pod.gpu.id}else{$null}; gpu_count=if($Pod.gpu){[int]$Pod.gpu.count}else{$null}; data_center_id=$Pod.dataCenterId; volume_id=(Get-RunpodNetworkMount $Pod).volumeId; cost_per_hr=$Pod.cost }
 }
 function Invoke-CreateReconciliation {
     param([System.Collections.IDictionary]$Body,[int]$TimeoutSec,[int]$PollSec)
@@ -120,22 +121,23 @@ function Invoke-CreateReconciliation {
 
 if ($MyInvocation.InvocationName -eq ".") { return }
 if (-not $Image) { $Image = $script:RunpodConfig.DefaultImage }
+if ($null -eq $GpuCount) { $GpuCount = [int]$script:RunpodConfig.DefaultGpuCount }
 if (-not $DiskGb) { $DiskGb = [int]$script:RunpodConfig.DefaultDiskGb }
 if (-not $Gpu -and -not $ListGpu) { throw "Pass one explicit -Gpu, or use -ListGpu." }
 if ($ExtraPort | Where-Object { $_ -notmatch '^\d+/(tcp|http)$' }) { throw "Each ExtraPort must be PORT/tcp or PORT/http." }
 
 if ($ListGpu) {
-    $catalog = @(Get-RunpodGpuCatalog -Cloud $script:RunpodConfig.DefaultCloud)
+    $catalog = @(Get-RunpodGpuCatalog -Cloud $script:RunpodConfig.DefaultCloud -GpuCount $GpuCount)
     $rows = foreach($item in $catalog) { $dc=@($item.dataCenters|Where-Object{$_.id -eq $script:Sprint.DataCenterId}|Select-Object -First 1); [pscustomobject]@{ID=$item.id;DisplayName=$item.name;Availability=if($dc.Count){$dc[0].availability}else{"NONE"}} }
     if($AvailableOnly){$rows=@($rows|Where-Object{$_.Availability-ne"NONE"})}; $rows|Sort-Object ID|Format-Table -AutoSize; return
 }
 $volume = Get-RunpodVolumeByName
 if (-not $volume) { throw "Volume '$($script:Sprint.VolumeName)' not found. Run volume-ensure.ps1 first." }
 if ([string]$volume.dataCenterId -ne $script:Sprint.DataCenterId) { throw "Resolved volume datacenter does not match configuration." }
-$catalog = @(Get-RunpodGpuCatalog -Cloud $script:RunpodConfig.DefaultCloud)
+$catalog = @(Get-RunpodGpuCatalog -Cloud $script:RunpodConfig.DefaultCloud -GpuCount $GpuCount)
 $gpuId = @(Resolve-RunpodGpuIds -Requested $Gpu -Catalog $catalog)[0]
 $requestId = [Guid]::NewGuid().ToString("N")
-$body = New-RunpodV2CreateBody -GpuId $gpuId -VolumeId $volume.id -RequestId $requestId
+$body = New-RunpodV2CreateBody -GpuId $gpuId -VolumeId $volume.id -RequestId $requestId -GpuCount $GpuCount
 $safe = New-SanitizedCreateRequest $body
 $evidence = [ordered]@{ schema=3; api_version="v2"; created_utc=Get-UtcStamp; request_hash=(Get-Sha256Text ($safe|ConvertTo-Json -Compress -Depth 20)); request=$safe; attempts=@(); catalog_cuda_versions=@($catalog|Where-Object{$_.id -eq $gpuId}|ForEach-Object{@{gpu_id=$gpuId;cuda_versions=@($_.cudaVersions)}}) }
 $existing = Invoke-CreateReconciliation -Body $body -TimeoutSec 1 -PollSec 1
@@ -181,7 +183,7 @@ for($attempt=1;$attempt -le $CreateAttempts -and -not $created;$attempt++) {
 Write-AtomicJson $EvidencePath $evidence
 if(-not $created){throw "Pod creation was not confirmed. Inspect sanitized evidence and the provider console before retrying."}
 $deadline = (Get-Date).AddMinutes(3)
-$ready = if (ConvertTo-RunpodActivePod $created) { $created } else { $null }
+$ready = $null
 while (-not $ready -and (Get-Date) -lt $deadline) {
     Start-Sleep -Seconds 8
     $current = Invoke-RunpodV2Api -Path "/pods/$($created.id)"
@@ -189,5 +191,9 @@ while (-not $ready -and (Get-Date) -lt $deadline) {
     if ([string]$current.status -in @("EXITED", "ERROR", "TERMINATED")) { break }
 }
 if(-not $ready){throw "Pod was created and may be billing, but direct SSH is not ready. Check status and terminate it if unused."}
+$evidence.ready_pod = Get-PodEvidence $ready
+$evidence.identity_verified = [bool](Test-RunpodPodBaseIdentity -Pod $ready -Body $body)
+Write-AtomicJson $EvidencePath $evidence
+if(-not $evidence.identity_verified){throw "Pod is RUNNING and may be billing, but its delivered identity or GPU count does not match the request. Inspect and terminate it before continuing."}
 if(-not $NoSync){& "$PSScriptRoot\runpod-sync.ps1"}
-Write-Host "Pod is RUNNING and may bill until pod-down.ps1 confirms deletion." -ForegroundColor Yellow
+Write-Host "Pod is RUNNING with $($ready.gpu.count) GPU(s) and may bill until pod-down.ps1 confirms deletion." -ForegroundColor Yellow

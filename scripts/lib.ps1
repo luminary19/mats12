@@ -20,7 +20,7 @@ function Get-RunpodConfig {
             throw "RunPod config is missing '$name'."
         }
     }
-    if ([int]$config.DefaultGpuCount -ne 1) { throw "This controller supports exactly one GPU." }
+    if ([int]$config.DefaultGpuCount -ne 1) { throw "Configured DefaultGpuCount must remain exactly 1; multi-GPU requires explicit -GpuCount." }
     if ([int]$config.ReconcileTimeoutSec -lt 1 -or [int]$config.ReconcilePollSec -lt 1) { throw "Reconciliation timing must be positive." }
     if ([string]$config.DataCenterId -notmatch "^[A-Z0-9-]+$") { throw "Configured datacenter is invalid." }
     return $config
@@ -101,8 +101,11 @@ function Get-RunpodVolumeByName {
     return $matches[0]
 }
 function Get-RunpodGpuCatalog {
-    param([ValidateSet("SECURE", "COMMUNITY")][string]$Cloud = "SECURE")
-    $response = Invoke-RunpodCatalogApi -Path "/v2/catalog/gpus?include=AVAILABILITY&product=POD&count=1&cloud=$Cloud"
+    param(
+        [ValidateSet("SECURE", "COMMUNITY")][string]$Cloud = "SECURE",
+        [ValidateRange(1,8)][int]$GpuCount = [int]$script:RunpodConfig.DefaultGpuCount
+    )
+    $response = Invoke-RunpodCatalogApi -Path "/v2/catalog/gpus?include=AVAILABILITY&product=POD&count=$GpuCount&cloud=$Cloud"
     if ($response.gpus) { return @($response.gpus) }
     return @($response)
 }
@@ -156,7 +159,7 @@ function Test-RunpodPodBaseIdentity {
 function ConvertTo-RunpodActivePod {
     param($Pod)
     if (-not $Pod -or [string]$Pod.status -ne "RUNNING" -or -not $Pod.ssh.direct -or -not $Pod.ssh.direct.host -or -not $Pod.ssh.direct.port) { return $null }
-    return [pscustomobject]@{ Id=$Pod.id; Name=$Pod.name; Ip=[string]$Pod.ssh.direct.host; Port=[int]$Pod.ssh.direct.port; User=if($Pod.ssh.direct.username){[string]$Pod.ssh.direct.username}else{$script:Sprint.SshUser}; Gpu=[string]$Pod.gpu.id; DataCenter=[string]$Pod.dataCenterId; CostPerHr=$Pod.cost }
+    return [pscustomobject]@{ Id=$Pod.id; Name=$Pod.name; Ip=[string]$Pod.ssh.direct.host; Port=[int]$Pod.ssh.direct.port; User=if($Pod.ssh.direct.username){[string]$Pod.ssh.direct.username}else{$script:Sprint.SshUser}; Gpu=[string]$Pod.gpu.id; GpuCount=[int]$Pod.gpu.count; DataCenter=[string]$Pod.dataCenterId; CostPerHr=$Pod.cost }
 }
 function Resolve-RunpodOwnedPod {
     param([System.Collections.IDictionary]$Body, [switch]$RequireCorrelation)

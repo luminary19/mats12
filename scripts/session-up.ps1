@@ -4,6 +4,7 @@ param(
     [Alias("GpuId")][string[]]$Gpu,
     [switch]$ListGpu,
     [switch]$AvailableOnly,
+    [ValidateRange(1,8)][Nullable[int]]$GpuCount,
     [int]$DiskGb,
     [string]$Image,
     [string[]]$ExtraPort = @(),
@@ -13,7 +14,8 @@ param(
 )
 $ErrorActionPreference = "Stop"
 . "$PSScriptRoot\lib.ps1"
-if ($ListGpu) { & "$PSScriptRoot\pod-up.ps1" -ListGpu -AvailableOnly:$AvailableOnly; exit $LASTEXITCODE }
+if ($null -eq $GpuCount) { $GpuCount = [int]$script:RunpodConfig.DefaultGpuCount }
+if ($ListGpu) { & "$PSScriptRoot\pod-up.ps1" -ListGpu -AvailableOnly:$AvailableOnly -GpuCount $GpuCount; exit $LASTEXITCODE }
 & "$PSScriptRoot\volume-ensure.ps1"
 Write-Host "Volume creation, if needed, may start storage billing." -ForegroundColor Yellow
 if (-not $Gpu) {
@@ -24,7 +26,7 @@ if (-not $Gpu) {
     if (-not $active) { throw "Configured pod is $($pods[0].status), not direct-SSH ready. Check status before creating or deleting anything." }
     & "$PSScriptRoot\runpod-sync.ps1"
 } else {
-    & "$PSScriptRoot\pod-up.ps1" -Gpu $Gpu -DiskGb $DiskGb -Image $Image -ExtraPort $ExtraPort -AllowedCudaVersions $AllowedCudaVersions -TemplateId $TemplateId -PublicDashboard:$PublicDashboard
+    & "$PSScriptRoot\pod-up.ps1" -Gpu $Gpu -GpuCount $GpuCount -DiskGb $DiskGb -Image $Image -ExtraPort $ExtraPort -AllowedCudaVersions $AllowedCudaVersions -TemplateId $TemplateId -PublicDashboard:$PublicDashboard
 }
 & "$PSScriptRoot\pod-bootstrap.ps1"
 Write-Host "Session ready. Start pull-loop.ps1 separately and run pod-down.ps1 when finished." -ForegroundColor Green

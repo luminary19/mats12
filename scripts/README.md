@@ -40,6 +40,7 @@ The normal entry point.
 ```powershell
 ./scripts/session-up.ps1 -ListGpu
 ./scripts/session-up.ps1 -ListGpu -AvailableOnly
+./scripts/session-up.ps1 -ListGpu -AvailableOnly -GpuCount 4
 ```
 
 Catalog mode does not call `volume-ensure.ps1` and cannot create storage or compute.
@@ -48,6 +49,7 @@ Catalog mode does not call `volume-ensure.ps1` and cannot create storage or comp
 
 ```powershell
 ./scripts/session-up.ps1 -Gpu 'NVIDIA GPU catalog id'
+./scripts/session-up.ps1 -Gpu 'GPU id' -GpuCount 4
 ./scripts/session-up.ps1 -Gpu 'GPU id' -AllowedCudaVersions 13.0
 ./scripts/session-up.ps1 -Gpu 'GPU id' -PublicDashboard
 ```
@@ -62,7 +64,7 @@ Normal mode:
 
 If an exact-name pod is provisioning or starting, creation adopts and waits rather than creating a duplicate. `EXITED`, `ERROR`, `TERMINATED`, multiple, or mismatched states fail closed and require operator action.
 
-Parameters: `-Gpu`, `-ListGpu`, `-AvailableOnly`, `-DiskGb`, `-Image`, `-ExtraPort`, `-AllowedCudaVersions`, `-TemplateId`, and `-PublicDashboard`. Unsupported creation modes are not exposed.
+Parameters: `-Gpu`, `-GpuCount` (default 1; use 2-8 only for data-parallel experiments), `-ListGpu`, `-AvailableOnly`, `-DiskGb`, `-Image`, `-ExtraPort`, `-AllowedCudaVersions`, `-TemplateId`, and `-PublicDashboard`. Unsupported creation modes are not exposed.
 
 ## `volume-ensure.ps1`
 
@@ -79,17 +81,20 @@ Overrides affect only creation of an absent volume.
 
 ## `pod-up.ps1`
 
-Lower-level one-GPU REST v2 creation. Normal users should prefer `session-up.ps1`.
+Lower-level REST v2 creation. It defaults to one GPU; `-GpuCount 2..8` is explicit and limited to data-parallel experiments. Normal users should prefer `session-up.ps1`.
 
 ```powershell
 ./scripts/pod-up.ps1 -ListGpu -AvailableOnly
+./scripts/pod-up.ps1 -ListGpu -AvailableOnly -GpuCount 4
 ./scripts/pod-up.ps1 -Gpu 'exact GPU id' -DryRun -EvidencePath ./pod-create.evidence.json
+./scripts/pod-up.ps1 -Gpu 'exact GPU id' -GpuCount 4 -DryRun -EvidencePath ./pod-create.evidence.json
 ./scripts/pod-up.ps1 -Gpu 'exact GPU id' -CreateAttempts 3 -RetryBaseSeconds 2
 ```
 
 Supported parameters:
 
 - `-Gpu`: exactly one ID, exact display name, or unambiguous catalog fragment;
+- `-GpuCount`: 1-8, defaulting to the configured value of 1; counts above 1 are explicit data-parallel experiments, never the default;
 - `-DiskGb`, `-Image`, `-ExtraPort`, `-TemplateId`;
 - `-AllowedCudaVersions`: optional nested v2 GPU constraint;
 - `-PublicDashboard`: adds unauthenticated `7860/http`;

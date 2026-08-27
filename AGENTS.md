@@ -28,7 +28,7 @@
 ## Safe lifecycle
 
 1. Run `scripts/session-up.ps1 -ListGpu -AvailableOnly` before provisioning; catalog mode must remain read-only.
-2. Use one explicit GPU. Do not add CPU, spot, any-GPU, priority, multi-GPU, or legacy placement modes without a separately reviewed design.
+2. Use one explicit GPU by default. Multi-GPU requires an explicit `-GpuCount` for a data-parallel experiment; it is not a default placement mode. Do not add CPU, spot, any-GPU, priority, or legacy placement modes without a separately reviewed design.
 3. Retain sanitized create evidence for the first live acceptance run.
 4. After startup, run `status.ps1` and `verify.ps1`, then start `pull-loop.ps1` separately.
 5. Stop compute with `pod-down.ps1` when idle. Confirm v2 deletion; preserve the volume.

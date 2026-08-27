@@ -36,13 +36,14 @@ $probe = "probe-$((Get-Date).Ticks)"
 $r = Invoke-PodSsh -Pod $pod -Command "echo __ssh_ok__" -AllowFail
 Check "ssh connectivity" ($r.Ok -and ($r.StdOut.Trim() -eq "__ssh_ok__")) $r.StdErr
 
-# 2. GPU - skip gracefully on CPU pods, validate a real GPU name otherwise
+# 2. GPU - validate both the provider-reported count and each device name
 $r = Invoke-PodSsh -Pod $pod -Command "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi --query-gpu=name --format=csv,noheader || echo __no_gpu__" -AllowFail
 $gpu = $r.StdOut.Trim()
+$gpuLines = @($r.Lines | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+$gpuNamesValid = @($gpuLines | Where-Object { $_ -notmatch '(?i)nvidia|rtx|tesla|h100|h200|a100|a40|l4|l40' }).Count -eq 0
 if (-not $r.Ok) { Check "gpu" $false $r.StdErr }
-elseif ($gpu -eq "__no_gpu__") { Info "gpu" "CPU pod - no nvidia-smi (expected for -Cpu pods)" }
-else { Check "gpu" ($gpu -match '(?i)nvidia|rtx|tesla|h100|h200|a100|a40|l4|l40') $gpu }
-
+elseif ($gpu -eq "__no_gpu__") { Check "gpu" $false "nvidia-smi is absent on a configured GPU pod" }
+else { Check "gpu" ($gpuLines.Count -eq [int]$pod.GpuCount -and $gpuNamesValid) ("expected {0}, observed {1}: {2}" -f $pod.GpuCount, $gpuLines.Count, ($gpuLines -join "; ")) }
 # 3. /workspace mounted + writable
 $r = Invoke-PodSsh -Pod $pod -Command "echo $probe > $($script:Sprint.WorkspacePath)/.vprobe && cat $($script:Sprint.WorkspacePath)/.vprobe && rm -f $($script:Sprint.WorkspacePath)/.vprobe" -AllowFail
 Check "/workspace writable" ($r.Ok -and ($r.StdOut -match $probe))

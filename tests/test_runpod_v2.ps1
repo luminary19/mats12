@@ -77,7 +77,9 @@ $PublicDashboard = $false
 $Image = "image"
 $DiskGb = 20
 $body = New-RunpodV2CreateBody -GpuId "gpu" -VolumeId "volume" -RequestId "request" -PublicKey "ssh-ed25519 value"
-Assert-Equal $body.gpu.count 1 "one GPU"
+Assert-Equal ([int]$body.gpu.count) ([int]$script:RunpodConfig.DefaultGpuCount) "default GPU count comes from runpod config"
+$fourGpuBody = New-RunpodV2CreateBody -GpuId "gpu" -VolumeId "volume" -RequestId "request" -PublicKey "ssh-ed25519 value" -GpuCount 4
+Assert-Equal ([int]$fourGpuBody.gpu.count) 4 "explicit GPU count is encoded"
 Assert-Equal $body.env.MATS12_REQUEST_ID "request" "correlation field"
 Assert-Equal $body.gpu.allowedCudaVersions[0] "12.8" "optional CUDA"
 $safe = New-SanitizedCreateRequest $body
@@ -87,6 +89,17 @@ Assert-Equal (Get-Sha256Text ($safe | ConvertTo-Json -Compress -Depth 20)) (Get-
 $AllowedCudaVersions = @()
 $noCuda = New-RunpodV2CreateBody -GpuId "gpu" -VolumeId "volume" -RequestId "request" -PublicKey "ssh-ed25519 value"
 Assert-True (-not $noCuda.gpu.Contains("allowedCudaVersions")) "CUDA omission"
+
+$script:TestCatalogPath = $null
+function Invoke-RunpodCatalogApi {
+    param([string]$Path)
+    $script:TestCatalogPath = $Path
+    return [pscustomobject]@{ gpus = @() }
+}
+@(Get-RunpodGpuCatalog -GpuCount 4) | Out-Null
+Assert-True ($script:TestCatalogPath -match "count=4") "catalog availability uses requested GPU count"
+Remove-Item -Path Function:\Invoke-RunpodCatalogApi
+Remove-Variable -Name TestCatalogPath -Scope Script
 
 $pod = [pscustomobject]@{
     id = "id"; name = $script:Sprint.PodName; status = "RUNNING"
@@ -101,11 +114,17 @@ Assert-True (Test-RunpodPodBaseIdentity $pod $noCuda -RequireCorrelation) "unres
 Assert-True (-not (Test-RunpodPodBaseIdentity $pod $body -RequireCorrelation)) "pinned CUDA rejects unknown host CUDA"
 $pod.cudaVersion = "12.8"
 Assert-True (Test-RunpodPodBaseIdentity $pod $body -RequireCorrelation) "pinned CUDA accepts exact host CUDA"
+$pod.gpu.count = 4
+Assert-True (Test-RunpodPodBaseIdentity $pod $fourGpuBody -RequireCorrelation) "explicit GPU count matches identity"
+$pod.gpu.count = 1
+Assert-True (-not (Test-RunpodPodBaseIdentity $pod $fourGpuBody -RequireCorrelation)) "mismatched GPU count rejects identity"
+Assert-Equal ([int](Get-PodEvidence $pod).gpu_count) 1 "pod evidence records delivered GPU count"
 $pod.image = "other"
 Assert-True (-not (Test-RunpodPodBaseIdentity $pod $body)) "mismatched image rejected"
 $pod.image = "image"
 $active = ConvertTo-RunpodActivePod $pod
 Assert-Equal $active.Ip "203.0.113.1" "direct SSH mapping"
+Assert-Equal ([int]$active.GpuCount) 1 "active pod mapping records delivered GPU count"
 $pod.status = "PROVISIONING"
 Assert-True (-not (ConvertTo-RunpodActivePod $pod)) "provisioning is not SSH ready"
 $pod.status = "RUNNING"
@@ -139,6 +158,8 @@ Assert-True (-not (Test-SshAlias "good`nHost evil")) "newline alias rejected"
 Assert-True (-not (Test-SshHostValue "host`nProxyCommand evil")) "newline host rejected"
 Assert-True (-not (Test-SshUserToken "root`nHost evil")) "newline user rejected"
 Assert-True (-not (Test-SshIdentityPath "key`nHost evil")) "newline identity rejected"
+Assert-ThrowsLike { & (Join-Path $root "scripts\pod-up.ps1") -GpuCount 0 } "ValidateRange|range" "pod-up rejects GPU count below range"
+Assert-ThrowsLike { & (Join-Path $root "scripts\session-up.ps1") -GpuCount 9 } "ValidateRange|range" "session-up rejects GPU count above range"
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("mats12-test-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory $tempRoot | Out-Null

@@ -16,7 +16,7 @@ Do not use it for experiment-specific model code or for unmanaged RunPod resourc
 1. Read `config/runpod.psd1` and confirm the volume, datacenter, image, paths, and exact pod name.
 2. Confirm `RUNPOD_API_KEY` is available without printing it, or point `RUNPOD_CONFIG_PATH` at an external uncommitted PSD1.
 3. Inspect capacity with `./scripts/session-up.ps1 -ListGpu -AvailableOnly`. This step must remain read-only.
-4. Choose one explicit GPU. For a request preview against an existing volume, use `./scripts/pod-up.ps1 -Gpu 'id' -DryRun -EvidencePath ./pod-create.evidence.json`. Evidence paths are ignored by Git.
+4. Choose one explicit GPU. Multi-GPU requires explicit `-GpuCount` and is only for data-parallel experiments, never the default. For a request preview against an existing volume, use `./scripts/pod-up.ps1 -Gpu 'id' -DryRun -EvidencePath ./pod-create.evidence.json`. Evidence paths are ignored by Git.
 5. Start with `./scripts/session-up.ps1 -Gpu 'id'`. Warn that an absent volume may be created and billed, and a pod may begin compute billing.
 6. Run `./scripts/status.ps1` and `./scripts/verify.ps1`. Direct SSH is required for SCP and tunnels.
 7. Start `./scripts/pull-loop.ps1` in a second terminal. Put non-versioned inputs in `upload/` and preview with `./scripts/push.ps1 -DryRun` before upload.

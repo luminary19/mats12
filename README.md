@@ -87,7 +87,7 @@ Get-Content ./config/runpod.psd1
 ./scripts/pod-down.ps1
 ```
 
-`pod-up.ps1` supports one explicit GPU only. CPU, spot, any-GPU, GPU-priority, multi-GPU, and legacy placement modes are intentionally absent. Optional host CUDA versions can be constrained with `-AllowedCudaVersions`.
+`pod-up.ps1` defaults to one explicit GPU. Multi-GPU requires an explicit `-GpuCount` and is limited to data-parallel experiments, not a default placement mode. CPU, spot, any-GPU, GPU-priority, and legacy placement modes are intentionally absent. Optional host CUDA versions can be constrained with `-AllowedCudaVersions`.
 
 ## Durable run contract
 
