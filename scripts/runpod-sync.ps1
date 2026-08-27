@@ -38,12 +38,32 @@ function Update-ManagedSshConfig {
     $parent = Split-Path -Parent $Path
     if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
     $existing = if (Test-Path -LiteralPath $Path) { [IO.File]::ReadAllText($Path) } else { "" }
-    $start = "# === $Alias (managed by mats12/scripts/runpod-sync.ps1) ==="
+    $normalized = $existing -replace "`r`n", "`n" -replace "`r", "`n"
+    $startPrefix = "# === $Alias (managed by "
+    $startPattern = "^" + [regex]::Escape($startPrefix) + "[^\r\n]*[\\/]scripts[\\/]runpod-sync\.ps1[^\r\n]*\) ===$"
     $end = "# === end $Alias ==="
-    $pattern = [regex]::Escape($start) + "[\s\S]*?" + [regex]::Escape($end)
-    $clean = ([regex]::Replace($existing, $pattern, "")) -replace "`r`n", "`n" -replace "`r", "`n"
-    $clean = $clean.TrimEnd()
-    $content = if ($clean) { $clean + "`n`n" + $Block + "`n" } else { $Block + "`n" }
+    $lines = @($normalized -split "`n", -1)
+    $kept = New-Object Collections.Generic.List[string]
+    $insideManagedBlock = $false
+    foreach ($line in $lines) {
+        $looksLikeManagedStart = $line.StartsWith($startPrefix, [StringComparison]::Ordinal)
+        if ($insideManagedBlock) {
+            if ($looksLikeManagedStart) { throw "Malformed managed SSH block for alias '$Alias': nested start or missing end marker." }
+            if ($line -eq $end) { $insideManagedBlock = $false }
+            continue
+        }
+        if ($looksLikeManagedStart) {
+            if ($line -notmatch $startPattern) { throw "Malformed managed SSH start marker for alias '$Alias'." }
+            $insideManagedBlock = $true
+            continue
+        }
+        if ($line -eq $end) { throw "Malformed managed SSH block for alias '$Alias': orphan end marker." }
+        [void]$kept.Add($line)
+    }
+    if ($insideManagedBlock) { throw "Malformed managed SSH block for alias '$Alias': missing end marker." }
+    $clean = ($kept -join "`n") -replace '(?:\n[ \t]*)+\z', ''
+    $normalizedBlock = (($Block -replace "`r`n", "`n" -replace "`r", "`n") -replace '(?:\n[ \t]*)+\z', '')
+    $content = if ($clean) { $clean + "`n`n" + $normalizedBlock + "`n" } else { $normalizedBlock + "`n" }
     $temp = Join-Path $parent ("." + [IO.Path]::GetFileName($Path) + "." + [Guid]::NewGuid().ToString("N") + ".tmp")
     $backup = "$Path.bak"
     try {

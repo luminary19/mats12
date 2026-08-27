@@ -47,6 +47,7 @@ $script:Sprint = [ordered]@{
     SshAlias = $script:RunpodConfig.SshAlias
     HeartbeatName = $script:RunpodConfig.HeartbeatName
     HeartbeatMaxAgeSec = [int]$script:RunpodConfig.HeartbeatMaxAgeSec
+    TrackioVersion = $script:RunpodConfig.TrackioVersion
     ApiBase = $script:RunpodConfig.ApiBase
     V2ApiBase = $script:RunpodConfig.V2ApiBase
     CatalogApiBase = $script:RunpodConfig.CatalogApiBase

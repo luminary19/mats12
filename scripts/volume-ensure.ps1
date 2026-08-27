@@ -21,7 +21,7 @@ param(
 . "$PSScriptRoot\lib.ps1"
 
 if (-not $SizeGb) {
-    $SizeGb = $script:Sprint.DefaultVolumeSizeGb
+    $SizeGb = $script:RunpodConfig.DefaultVolumeSizeGb
 }
 if (-not $DataCenter) {
     $DataCenter = $script:Sprint.DataCenterId

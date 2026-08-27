@@ -27,6 +27,29 @@ function Assert-ThrowsLike {
 
 Assert-Equal $script:Sprint.PodName "mats12-pod" "config exact pod identity"
 Assert-Equal $script:Sprint.VolumeName "mats12" "config volume identity"
+Assert-Equal $script:Sprint.TrackioVersion $script:RunpodConfig.TrackioVersion "config Trackio version projection"
+
+$expectedVolumeSizeGb = (Import-PowerShellDataFile -LiteralPath (Join-Path $root "config\runpod.psd1")).DefaultVolumeSizeGb
+$global:TestRunpodVolumeEnsureRequest = $null
+$priorApiKey = $env:RUNPOD_API_KEY
+try {
+    $env:RUNPOD_API_KEY = "unit-test-runpod-key"
+    function Invoke-RestMethod {
+        param($Method, $Uri, $Headers, $ContentType, $Body)
+        if ($Method -eq "GET") { return [pscustomobject]@{ items = @() } }
+        if ($Method -eq "POST") {
+            $global:TestRunpodVolumeEnsureRequest = $Body | ConvertFrom-Json
+            return [pscustomobject]@{ id = "test-volume"; size = $global:TestRunpodVolumeEnsureRequest.size; dataCenterId = $global:TestRunpodVolumeEnsureRequest.dataCenterId }
+        }
+        throw "Unexpected mocked RunPod method: $Method"
+    }
+    & (Join-Path $root "scripts\volume-ensure.ps1")
+    Assert-Equal ([int]$global:TestRunpodVolumeEnsureRequest.size) ([int]$expectedVolumeSizeGb) "volume ensure default size comes from runpod config"
+} finally {
+    Remove-Item -Path Function:\Invoke-RestMethod -ErrorAction SilentlyContinue
+    Remove-Variable -Name TestRunpodVolumeEnsureRequest -Scope Global -ErrorAction SilentlyContinue
+    $env:RUNPOD_API_KEY = $priorApiKey
+}
 
 $priorApiKey = $env:RUNPOD_API_KEY
 $priorConfigPath = $env:RUNPOD_CONFIG_PATH
@@ -134,13 +157,34 @@ try {
     }
 
     $config = Join-Path $tempRoot "config"
-    [IO.File]::WriteAllText($config, "Host unrelated`n    HostName example`n")
+    [IO.File]::WriteAllText($config, "# === safe (managed by old/scripts/runpod-sync.ps1 - do not edit by hand) ===`nHost safe`n    HostName stale.example`n# === end safe ===`n`nHost unrelated`n    HostName example`n")
     $block = New-ManagedSshBlock "safe" "example.com" "root" 22 "C:\key"
     Update-ManagedSshConfig $config "safe" $block
-    Assert-True ((Get-Content $config -Raw) -match "Host unrelated") "unrelated SSH entry preserved"
+    $updatedConfig = [IO.File]::ReadAllText($config)
+    Assert-True ($updatedConfig -match "Host unrelated") "unrelated SSH entry preserved"
+    Assert-True ($updatedConfig -notmatch "stale.example") "stale managed alias removed"
+    Assert-Equal ([regex]::Matches($updatedConfig, "(?m)^Host safe$").Count) 1 "only one managed alias remains"
     Update-ManagedSshConfig $config "safe" $block
+    $secondUpdate = [IO.File]::ReadAllText($config)
+    Assert-Equal $secondUpdate $updatedConfig "SSH update is byte-idempotent"
     Assert-True (Test-Path "$config.bak") "SSH backup exists"
-    Assert-True ((Get-Content "$config.bak" -Raw) -match "Host safe") "SSH backup preserves previous config"
+    Assert-Equal ([IO.File]::ReadAllText("$config.bak")) $updatedConfig "SSH backup preserves previous config"
+
+    $multiConfig = Join-Path $tempRoot "config-multiple"
+    $multiOriginal = "# === safe (managed by old/scripts/runpod-sync.ps1 - do not edit by hand) ===`r`nHost safe`r`n    HostName first-stale.example`r`n# === end safe ===`r`n`r`nHost manual-critical`r`n    HostName manual.example`r`n`r`n# === safe (managed by newer/scripts/runpod-sync.ps1) ===`r`nHost safe`r`n    HostName second-stale.example`r`n# === end safe ===`r`n`r`nHost manual-tail`r`n    HostName tail.example`r`n"
+    [IO.File]::WriteAllText($multiConfig, $multiOriginal)
+    Update-ManagedSshConfig $multiConfig "safe" $block
+    $multiUpdated = [IO.File]::ReadAllText($multiConfig)
+    Assert-True ($multiUpdated -match "Host manual-critical`n    HostName manual.example") "manual host between managed blocks preserved"
+    Assert-True ($multiUpdated -match "Host manual-tail`n    HostName tail.example") "manual host after managed blocks preserved"
+    Assert-True ($multiUpdated -notmatch "first-stale|second-stale") "multiple stale managed aliases removed"
+    Assert-Equal ([regex]::Matches($multiUpdated, "(?m)^Host safe$").Count) 1 "multiple managed aliases collapse to one"
+
+    $brokenConfig = Join-Path $tempRoot "config-broken"
+    $brokenOriginal = "# === safe (managed by old/scripts/runpod-sync.ps1 - do not edit by hand) ===`nHost safe`n    HostName truncated.example`nHost manual-critical`n    HostName preserve.example`n# === safe (managed by newer/scripts/runpod-sync.ps1) ===`nHost safe`n    HostName complete.example`n# === end safe ===`n"
+    [IO.File]::WriteAllText($brokenConfig, $brokenOriginal)
+    Assert-ThrowsLike { Update-ManagedSshConfig $brokenConfig "safe" $block } "Malformed managed SSH block" "truncated managed block fails closed"
+    Assert-Equal ([IO.File]::ReadAllText($brokenConfig)) $brokenOriginal "failed SSH update preserves the original file exactly"
 
     $remoteTemp = "/tmp/a b'c;`$x"
     $remoteFinal = "/in/final a'c;`$x"

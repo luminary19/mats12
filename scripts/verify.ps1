@@ -53,7 +53,7 @@ $tk = $r.StdOut.Trim()
 Check "venv + trackio" ($r.Ok -and ($tk -eq $script:Sprint.TrackioVersion)) ("trackio " + $tk)
 
 # 5. TRACKIO_DIR baked into the venv activate
-$r = Invoke-PodSsh -Pod $pod -Command '. $($script:Sprint.RemoteVenv)/bin/activate && echo $TRACKIO_DIR' -AllowFail
+$r = Invoke-PodSsh -Pod $pod -Command ". $($script:Sprint.RemoteVenv)/bin/activate && printenv TRACKIO_DIR" -AllowFail
 Check "TRACKIO_DIR pinned" ($r.Ok -and ($r.StdOut.Trim() -eq "$($script:Sprint.RemoteTrackio)")) $r.StdOut.Trim()
 
 # 6. scp round-trip (up then down, compare content)
