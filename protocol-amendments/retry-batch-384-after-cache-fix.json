@@ -1,0 +1,20 @@
+{
+  "allocator_cleanup_before_every_attempt": true,
+  "authorization_reason": "Retry the poisoned batch-512 scheduler cycle only after allocator cleanup runs before every attempt.",
+  "authorization_timestamp": "2026-08-27T20:34:47Z",
+  "authorizing_user_decision": "make it 384 instead of 512",
+  "decision": "retry_batch_384_after_allocator_cache_fix",
+  "effective_completed_batches": 24,
+  "effective_completed_rows": 5824,
+  "first_amendment_path": "protocol-amendments/resume-batch-512.json",
+  "first_amendment_sha256": "9620d3e5fc9cdcd938df1e0bd4ea5bd64d1e6ee1730cff0bcb8fbe1330780b5e",
+  "format": "teacher-scheduler-recovery-amendment-v1",
+  "input_sha256": "bcb0fe4fe7ced8ba04bbc0adf76c480ee4d6410ac63333f2bfed9bfe4f2e9534",
+  "memory_pressure_threshold": 0.92,
+  "model_revision": "05b9e7c9b978ba29bdb8f50a49c30e4b91183339",
+  "previous_reconstructed_max_batch_size": 32,
+  "raw_prior_batches_immutable": true,
+  "retry_max_batch_size": 384,
+  "run_directory": "olmo-clean-19996-abliterated-b200-20260827T0951Z",
+  "scheduler_journal_immutable": true
+}

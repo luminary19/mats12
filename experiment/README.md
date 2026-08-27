@@ -24,11 +24,14 @@ paths and revision, generation settings, output model label, and the adaptive sc
 All prompts are rendered/tokenized before generation into an immutable layout, then pending
 rows are sorted by input length and original index. Batches begin at 256, shrink for the
 32-bit grouped-convolution safety budget, OOM/indexing retries, or >=85% VRAM pressure,
-and never grow, except for the exact execution-only resume amendment below. That amendment
-requires `--resume-max-batch-size 512 --resume-memory-pressure-threshold 0.92`, preserves all
-prior immutable batches/configuration, and resumes normal fallback at OOM/index failure or
->=92% pressure. Transformers sampling resets seed 42 for every successful attempted batch,
-so outputs are batch-layout-dependent; no batch-size-independent row RNG is claimed. Final
+and never grow except for authorized execution-only amendments. The historical resume requires
+`--resume-max-batch-size 512 --resume-memory-pressure-threshold 0.92`. At exactly 24 immutable
+batches / 5,824 rows after its stale-pressure 512→32 fallback and dangling 32-row attempt, the
+separate exact `protocol-amendments/retry-batch-384-after-cache-fix.json` authorizes only
+`--recovery-max-batch-size 384`; it records the first amendment hash, preserves prior batch/journal
+evidence, cleans the allocator before every attempt, and restores normal fallback (first 384→256).
+Transformers sampling resets seed 42 for every successful attempted batch, so outputs are
+batch-layout-dependent; no batch-size-independent row RNG is claimed. Final
 batches are never changed; an interrupted current call is discarded. `DONE` is written only
 after exact 19,996-row coverage, no blank responses, and atomic five-key Conmy-compatible
 `output/rollouts.jsonl` export with checksum validation. Exposed `<think>` tags fail closed

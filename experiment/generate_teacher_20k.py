@@ -6,6 +6,7 @@ calls.  Execution uses the native local tokenizer template and immutable batches
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import os
@@ -71,6 +72,29 @@ SCHEDULER_RESUME_EFFECTIVE_BATCHES = 21
 SCHEDULER_RESUME_EFFECTIVE_ROWS = 5_376
 SCHEDULER_RESUME_PREVIOUS_MEMORY_PRESSURE_THRESHOLD = 0.85
 SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD = 0.92
+SCHEDULER_RECOVERY_AMENDMENT_FORMAT = "teacher-scheduler-recovery-amendment-v1"
+SCHEDULER_RECOVERY_AMENDMENT_RELATIVE_PATH = Path("protocol-amendments") / "retry-batch-384-after-cache-fix.json"
+SCHEDULER_RECOVERY_DECISION = "retry_batch_384_after_allocator_cache_fix"
+SCHEDULER_RECOVERY_AUTHORIZING_USER_DECISION = "make it 384 instead of 512"
+SCHEDULER_RECOVERY_AUTHORIZATION_TIMESTAMP = "2026-08-27T20:34:47Z"
+SCHEDULER_RECOVERY_AUTHORIZATION_REASON = (
+    "Retry the poisoned batch-512 scheduler cycle only after allocator cleanup runs before every attempt."
+)
+SCHEDULER_RECOVERY_AMENDMENT_KEYS = {
+    "format", "run_directory", "input_sha256", "model_revision", "decision", "first_amendment_path",
+    "first_amendment_sha256", "previous_reconstructed_max_batch_size", "retry_max_batch_size",
+    "memory_pressure_threshold", "effective_completed_batches", "effective_completed_rows",
+    "allocator_cleanup_before_every_attempt", "raw_prior_batches_immutable", "scheduler_journal_immutable",
+    "authorization_timestamp", "authorization_reason", "authorizing_user_decision",
+}
+SCHEDULER_RECOVERY_EVENT_KEYS = {
+    "event", "amendment_path", "amendment_sha256", "prior_max_batch_size", "next_max_batch_size",
+    "memory_pressure_threshold", "effective_completed_batches", "effective_completed_rows",
+}
+SCHEDULER_RECOVERY_PREVIOUS_MAX = 32
+SCHEDULER_RECOVERY_MAX = 384
+SCHEDULER_RECOVERY_EFFECTIVE_BATCHES = 24
+SCHEDULER_RECOVERY_EFFECTIVE_ROWS = 5_824
 LAYOUT_KEYS = ("id", "original_index", "prompt_sha256", "rendered_prompt_sha256", "input_tokens")
 ROW_KEYS = (
     "id", "source", "prompt", "response", "model", "model_revision", "tokenizer_path",
@@ -331,7 +355,8 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
     completed = _validate_existing(Path(args.run_dir), config, prompts)
     resume = _resume_scheduler_state(Path(args.run_dir), config, len(completed),
                                      _arg(args, "resume_max_batch_size", None),
-                                     _arg(args, "resume_memory_pressure_threshold", None))
+                                     _arg(args, "resume_memory_pressure_threshold", None),
+                                     _arg(args, "recovery_max_batch_size", None))
     completed_ids = {row["id"] for row in completed}
     return {"prompt_count": len(prompts), "completed": len(completed_ids),
             "pending": len(prompts) - len(completed_ids),
@@ -535,6 +560,43 @@ def _scheduler_resume_amendment(run_dir: Path, config: Mapping[str, Any], *, req
             "decision": amendment["decision"]}
 
 
+def _scheduler_allocator_recovery_amendment(run_dir: Path, config: Mapping[str, Any],
+                                             first_amendment: Mapping[str, Any] | None,
+                                             *, required: bool) -> dict[str, Any] | None:
+    path = run_dir / SCHEDULER_RECOVERY_AMENDMENT_RELATIVE_PATH
+    if not path.exists():
+        if required:
+            raise ValidationError("--recovery-max-batch-size requires the immutable allocator recovery amendment")
+        return None
+    if not path.is_file():
+        raise ValidationError("scheduler allocator recovery amendment path is not a file")
+    if first_amendment is None:
+        raise ValidationError("scheduler allocator recovery amendment requires the first scheduler amendment")
+    amendment = _read_json(path, "scheduler allocator recovery amendment")
+    if set(amendment) != SCHEDULER_RECOVERY_AMENDMENT_KEYS:
+        raise ValidationError("scheduler allocator recovery amendment schema differs from authorization")
+    if (amendment["format"] != SCHEDULER_RECOVERY_AMENDMENT_FORMAT or
+            amendment["run_directory"] != run_dir.name or amendment["input_sha256"] != config["input_sha256"] or
+            amendment["model_revision"] != config["model"]["revision"] or
+            amendment["decision"] != SCHEDULER_RECOVERY_DECISION or
+            amendment["first_amendment_path"] != first_amendment["path"] or
+            amendment["first_amendment_sha256"] != first_amendment["sha256"] or
+            amendment["previous_reconstructed_max_batch_size"] != SCHEDULER_RECOVERY_PREVIOUS_MAX or
+            amendment["retry_max_batch_size"] != SCHEDULER_RECOVERY_MAX or
+            amendment["memory_pressure_threshold"] != SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD or
+            amendment["effective_completed_batches"] != SCHEDULER_RECOVERY_EFFECTIVE_BATCHES or
+            amendment["effective_completed_rows"] != SCHEDULER_RECOVERY_EFFECTIVE_ROWS or
+            amendment["allocator_cleanup_before_every_attempt"] is not True or
+            amendment["raw_prior_batches_immutable"] is not True or
+            amendment["scheduler_journal_immutable"] is not True or
+            amendment["authorization_timestamp"] != SCHEDULER_RECOVERY_AUTHORIZATION_TIMESTAMP or
+            amendment["authorization_reason"] != SCHEDULER_RECOVERY_AUTHORIZATION_REASON or
+            amendment["authorizing_user_decision"] != SCHEDULER_RECOVERY_AUTHORIZING_USER_DECISION):
+        raise ValidationError("scheduler allocator recovery amendment is not authorized for this immutable run")
+    return {"path": SCHEDULER_RECOVERY_AMENDMENT_RELATIVE_PATH.as_posix(), "sha256": sha256_file(path),
+            "decision": amendment["decision"]}
+
+
 def _scheduler_batch_manifests(run_dir: Path) -> list[tuple[Path, dict[str, Any]]]:
     return [(batch, _read_json(batch / "manifest.json", "batch manifest"))
             for batch in finalized_batches(run_dir / "batches")]
@@ -551,6 +613,21 @@ def _validate_scheduler_resume_boundary(batch_manifests: Sequence[tuple[Path, Ma
         raise ValidationError("immutable scheduler resume boundary differs from authorized rows")
 
 
+def _validate_scheduler_allocator_recovery_boundary(batch_manifests: Sequence[tuple[Path, Mapping[str, Any]]]) -> None:
+    if len(batch_manifests) < SCHEDULER_RECOVERY_EFFECTIVE_BATCHES:
+        raise ValidationError("allocator recovery amendment requires 24 immutable batches")
+    boundary_rows = sum(manifest["row_count"] for _, manifest in
+                        batch_manifests[:SCHEDULER_RECOVERY_EFFECTIVE_BATCHES])
+    if boundary_rows != SCHEDULER_RECOVERY_EFFECTIVE_ROWS:
+        raise ValidationError("immutable allocator recovery boundary differs from authorized rows")
+    expected = ((256, 256, 128), (128, 128, 64), (64, 64, 32))
+    for offset, (row_count, before, after) in enumerate(expected, start=SCHEDULER_RESUME_EFFECTIVE_BATCHES):
+        batch, manifest = batch_manifests[offset]
+        if (manifest.get("row_count"), manifest.get("actual_size"), manifest.get("scheduler_max_before"),
+                manifest.get("scheduler_max_after")) != (row_count, row_count, before, after):
+            raise ValidationError("allocator recovery requires the immutable 512-to-32 scheduler history: %s" % batch)
+
+
 def _scheduler_amendment_event(event: Mapping[str, Any], amendment: Mapping[str, Any]) -> None:
     expected = {"event": "scheduler_amendment_applied", "amendment_path": amendment["path"],
                 "amendment_sha256": amendment["sha256"], "prior_max_batch_size": SCHEDULER_RESUME_PREVIOUS_MAX,
@@ -563,75 +640,112 @@ def _scheduler_amendment_event(event: Mapping[str, Any], amendment: Mapping[str,
         raise ValidationError("scheduler amendment event differs from immutable authorization")
 
 
+def _scheduler_allocator_recovery_event(event: Mapping[str, Any], amendment: Mapping[str, Any]) -> None:
+    expected = {"event": "scheduler_allocator_recovery_applied", "amendment_path": amendment["path"],
+                "amendment_sha256": amendment["sha256"], "prior_max_batch_size": SCHEDULER_RECOVERY_PREVIOUS_MAX,
+                "next_max_batch_size": SCHEDULER_RECOVERY_MAX,
+                "memory_pressure_threshold": SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD,
+                "effective_completed_batches": SCHEDULER_RECOVERY_EFFECTIVE_BATCHES,
+                "effective_completed_rows": SCHEDULER_RECOVERY_EFFECTIVE_ROWS}
+    if set(event) != SCHEDULER_RECOVERY_EVENT_KEYS or dict(event) != expected:
+        raise ValidationError("scheduler allocator recovery event differs from immutable authorization")
+
+
 def _scheduler_evidence_state(run_dir: Path, config: Mapping[str, Any],
                               batch_manifests: Sequence[tuple[Path, Mapping[str, Any]]],
-                              amendment: Mapping[str, Any] | None) -> tuple[int, bool]:
+                              amendment: Mapping[str, Any] | None,
+                              recovery_amendment: Mapping[str, Any] | None) -> tuple[int, bool, bool]:
     initial = config["adaptive_scheduler"]["initial_max_batch_size"]
     path = run_dir / "scheduler.jsonl"
     events = list(iter_jsonl(path)) if path.exists() else []
     amendment_events = [event for event in events if event.get("event") == "scheduler_amendment_applied"]
-    if len(amendment_events) > 1:
-        raise ValidationError("scheduler amendment event appears more than once")
-    amendment_applied = bool(amendment_events)
-    if amendment_applied:
+    recovery_events = [event for event in events if event.get("event") == "scheduler_allocator_recovery_applied"]
+    if len(amendment_events) > 1 or len(recovery_events) > 1:
+        raise ValidationError("scheduler amendment or allocator recovery event appears more than once")
+    if amendment_events:
         if amendment is None:
             raise ValidationError("scheduler amendment event has no immutable amendment")
         _scheduler_amendment_event(amendment_events[0], amendment)
+    if recovery_events:
+        if recovery_amendment is None:
+            raise ValidationError("scheduler allocator recovery event has no immutable amendment")
+        _scheduler_allocator_recovery_event(recovery_events[0], recovery_amendment)
+        _validate_scheduler_allocator_recovery_boundary(batch_manifests)
 
-    current, amendment_seen, journal_resume_shrunk = initial, False, False
+    current, amendment_seen, recovery_seen = initial, False, False
+    journal_resume_shrunk = False
+    previous_event: Mapping[str, Any] | None = None
     for event in events:
-        if event.get("event") == "scheduler_amendment_applied":
+        event_name = event.get("event")
+        if event_name == "scheduler_amendment_applied":
             _scheduler_amendment_event(event, amendment)  # type: ignore[arg-type]
             if amendment_seen or current != SCHEDULER_RESUME_PREVIOUS_MAX:
                 raise ValidationError("scheduler amendment is not a single authorized transition from 256")
             current, amendment_seen = SCHEDULER_RESUME_MAX, True
-            continue
-        maximum = SCHEDULER_RESUME_MAX if amendment_seen else initial
-        attempt_max = event.get("max_batch_size")
-        if attempt_max is not None and (not isinstance(attempt_max, int) or not 1 <= attempt_max <= current):
-            raise ValidationError("scheduler attempt exceeds reconstructed durable state")
-        next_max = event.get("next_max_batch_size")
-        if next_max is None:
-            continue
-        if not isinstance(next_max, int) or not 1 <= next_max <= maximum or next_max > current:
-            raise ValidationError("unauthorized scheduler increase or invalid durable scheduler event")
-        current = next_max
-        if amendment_seen and current < SCHEDULER_RESUME_MAX:
-            journal_resume_shrunk = True
+        elif event_name == "scheduler_allocator_recovery_applied":
+            _scheduler_allocator_recovery_event(event, recovery_amendment)  # type: ignore[arg-type]
+            if (not amendment_seen or recovery_seen or current != SCHEDULER_RECOVERY_PREVIOUS_MAX or
+                    previous_event is None or previous_event.get("event") != "attempt" or
+                    previous_event.get("max_batch_size") != SCHEDULER_RECOVERY_PREVIOUS_MAX or
+                    previous_event.get("actual_size") != SCHEDULER_RECOVERY_PREVIOUS_MAX):
+                raise ValidationError("allocator recovery is not the single authorized transition from dangling 32")
+            current, recovery_seen = SCHEDULER_RECOVERY_MAX, True
+        else:
+            maximum = SCHEDULER_RECOVERY_MAX if recovery_seen else (SCHEDULER_RESUME_MAX if amendment_seen else initial)
+            attempt_max = event.get("max_batch_size")
+            if attempt_max is not None and (not isinstance(attempt_max, int) or not 1 <= attempt_max <= current):
+                raise ValidationError("scheduler attempt exceeds reconstructed durable state")
+            next_max = event.get("next_max_batch_size")
+            if next_max is not None:
+                if not isinstance(next_max, int) or not 1 <= next_max <= maximum or next_max > current:
+                    raise ValidationError("unauthorized scheduler increase or invalid durable scheduler event")
+                current = next_max
+                if amendment_seen and not recovery_seen and current < SCHEDULER_RESUME_MAX:
+                    journal_resume_shrunk = True
+        previous_event = event
 
     batch_resume_values: list[int] = []
     base_batch_values: list[int] = []
-    resume_batch_shrunk = False
+    recovery_batch_values: list[int] = []
+    resume_batch_shrunk, recovery_batch_shrunk = False, False
     for batch_index, (batch, manifest) in enumerate(batch_manifests):
         before, after = manifest.get("scheduler_max_before"), manifest.get("scheduler_max_after")
         if (not isinstance(before, int) or not isinstance(after, int) or before < 1 or after < 1 or after > before or
                 before > SCHEDULER_RESUME_MAX):
             raise ValidationError("invalid scheduler batch evidence: %s" % batch)
-        if before > initial or after > initial:
-            if not amendment_applied or before != SCHEDULER_RESUME_MAX:
+        if recovery_seen and batch_index >= SCHEDULER_RECOVERY_EFFECTIVE_BATCHES:
+            if before > SCHEDULER_RECOVERY_MAX:
+                raise ValidationError("unauthorized post-recovery scheduler maximum: %s" % batch)
+            if recovery_batch_shrunk and before == SCHEDULER_RECOVERY_MAX:
+                raise ValidationError("scheduler batch evidence reapplies 384 after an adaptive shrink")
+            recovery_batch_values.append(after)
+            if after < SCHEDULER_RECOVERY_MAX:
+                recovery_batch_shrunk = True
+        elif before > initial or after > initial:
+            if not amendment_seen or before != SCHEDULER_RESUME_MAX:
                 raise ValidationError("unauthorized scheduler increase in batch evidence: %s" % batch)
             if resume_batch_shrunk:
                 raise ValidationError("scheduler batch evidence reapplies 512 after an adaptive shrink")
             batch_resume_values.append(after)
             if after < SCHEDULER_RESUME_MAX:
                 resume_batch_shrunk = True
-        elif (amendment_applied and batch_index >= SCHEDULER_RESUME_EFFECTIVE_BATCHES and
+        elif (amendment_seen and batch_index >= SCHEDULER_RESUME_EFFECTIVE_BATCHES and
               (resume_batch_shrunk or journal_resume_shrunk)):
-            # After an adaptive fall-back, this lower-max batch can close the same journal crash window.
             batch_resume_values.append(after)
         else:
             base_batch_values.append(after)
-    if not amendment_applied and base_batch_values:
-        # Batch evidence closes the crash window after publication but before its journal entry.
+    if recovery_seen and recovery_batch_values:
+        current = min(current, min(recovery_batch_values))
+    elif not amendment_seen and base_batch_values:
         current = min(current, min(base_batch_values))
-    elif amendment_applied and batch_resume_values:
-        # A finalized resumed batch is authoritative if a crash prevented its redundant journal event.
+    elif amendment_seen and not recovery_seen and batch_resume_values:
         current = min(current, min(batch_resume_values))
-    return current, amendment_applied
+    return current, amendment_seen, recovery_seen
 
 
 def _resume_scheduler_state(run_dir: Path, config: Mapping[str, Any], completed_rows: int,
-                            requested_max: Any = None, requested_threshold: Any = None, *, apply: bool = False) -> dict[str, Any]:
+                            requested_max: Any = None, requested_threshold: Any = None,
+                            requested_recovery_max: Any = None, *, apply: bool = False) -> dict[str, Any]:
     if requested_max is not None and requested_max != SCHEDULER_RESUME_MAX:
         raise ValidationError("only --resume-max-batch-size 512 is authorized")
     if requested_threshold is not None and requested_threshold != SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD:
@@ -640,11 +754,23 @@ def _resume_scheduler_state(run_dir: Path, config: Mapping[str, Any], completed_
         raise ValidationError("--resume-memory-pressure-threshold requires --resume-max-batch-size 512")
     if requested_max is not None and requested_threshold != SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD:
         raise ValidationError("--resume-max-batch-size 512 requires --resume-memory-pressure-threshold 0.92")
-    amendment = _scheduler_resume_amendment(run_dir, config, required=requested_max is not None)
+    if requested_recovery_max is not None and requested_recovery_max != SCHEDULER_RECOVERY_MAX:
+        raise ValidationError("only --recovery-max-batch-size 384 is authorized")
+    amendment = _scheduler_resume_amendment(
+        run_dir, config, required=requested_max is not None or requested_recovery_max is not None)
+    recovery_amendment = _scheduler_allocator_recovery_amendment(
+        run_dir, config, amendment, required=requested_recovery_max is not None)
     batch_manifests = _scheduler_batch_manifests(run_dir)
     if amendment is not None:
         _validate_scheduler_resume_boundary(batch_manifests, completed_rows)
-    current, amendment_applied = _scheduler_evidence_state(run_dir, config, batch_manifests, amendment)
+    if recovery_amendment is not None:
+        _validate_scheduler_allocator_recovery_boundary(batch_manifests)
+    current, amendment_applied, recovery_applied = _scheduler_evidence_state(
+        run_dir, config, batch_manifests, amendment, recovery_amendment)
+    if (recovery_amendment is not None and not recovery_applied and
+            (len(batch_manifests) != SCHEDULER_RECOVERY_EFFECTIVE_BATCHES or
+             completed_rows != SCHEDULER_RECOVERY_EFFECTIVE_ROWS)):
+        raise ValidationError("allocator recovery amendment is outside immutable boundary 24/5,824")
     if requested_max is not None and not amendment_applied:
         if current != SCHEDULER_RESUME_PREVIOUS_MAX:
             raise ValidationError("scheduler resume amendment cannot override an already reduced scheduler")
@@ -658,15 +784,35 @@ def _resume_scheduler_state(run_dir: Path, config: Mapping[str, Any], completed_
                 effective_completed_batches=SCHEDULER_RESUME_EFFECTIVE_BATCHES,
                 effective_completed_rows=SCHEDULER_RESUME_EFFECTIVE_ROWS,
             )
-            current, amendment_applied = _scheduler_evidence_state(run_dir, config, batch_manifests, amendment)
+            current, amendment_applied, recovery_applied = _scheduler_evidence_state(
+                run_dir, config, batch_manifests, amendment, recovery_amendment)
         else:
             current = SCHEDULER_RESUME_MAX
-    return {"current_max_batch_size": current, "amendment": amendment,
-            "amendment_applied": amendment_applied,
+    if requested_recovery_max is not None and not recovery_applied:
+        if (current != SCHEDULER_RECOVERY_PREVIOUS_MAX or len(batch_manifests) != SCHEDULER_RECOVERY_EFFECTIVE_BATCHES or
+                completed_rows != SCHEDULER_RECOVERY_EFFECTIVE_ROWS):
+            raise ValidationError("allocator recovery amendment can apply only at immutable boundary 24/5,824")
+        if apply:
+            _append_scheduler_event(
+                run_dir, event="scheduler_allocator_recovery_applied", amendment_path=recovery_amendment["path"],
+                amendment_sha256=recovery_amendment["sha256"], prior_max_batch_size=SCHEDULER_RECOVERY_PREVIOUS_MAX,
+                next_max_batch_size=SCHEDULER_RECOVERY_MAX,
+                memory_pressure_threshold=SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD,
+                effective_completed_batches=SCHEDULER_RECOVERY_EFFECTIVE_BATCHES,
+                effective_completed_rows=SCHEDULER_RECOVERY_EFFECTIVE_ROWS,
+            )
+            current, amendment_applied, recovery_applied = _scheduler_evidence_state(
+                run_dir, config, batch_manifests, amendment, recovery_amendment)
+        else:
+            current = SCHEDULER_RECOVERY_MAX
+    return {"current_max_batch_size": current, "amendment": amendment, "recovery_amendment": recovery_amendment,
+            "amendment_applied": amendment_applied, "recovery_applied": recovery_applied,
             "memory_pressure_threshold": (SCHEDULER_RESUME_MEMORY_PRESSURE_THRESHOLD
-                                          if amendment_applied or requested_max is not None
+                                          if amendment_applied or recovery_applied or requested_max is not None or
+                                          requested_recovery_max is not None
                                           else config["adaptive_scheduler"]["memory_pressure_threshold"]),
-            "authorized_resume_max_batch_size": SCHEDULER_RESUME_MAX if amendment is not None else None}
+            "authorized_resume_max_batch_size": SCHEDULER_RESUME_MAX if amendment is not None else None,
+            "authorized_recovery_max_batch_size": SCHEDULER_RECOVERY_MAX if recovery_amendment is not None else None}
 
 
 def _scheduler_max_from_evidence(run_dir: Path, config: Mapping[str, Any]) -> int:
@@ -693,6 +839,8 @@ def _recoverable_generation_error(torch: Any, exc: BaseException) -> bool:
 
 def _reduced_scheduler_max(before: int, attempted_size: int) -> int:
     if before == SCHEDULER_RESUME_MAX:
+        return SCHEDULER_RESUME_PREVIOUS_MAX
+    if before == SCHEDULER_RECOVERY_MAX:
         return SCHEDULER_RESUME_PREVIOUS_MAX
     return min(max(1, before // 2), max(1, attempted_size // 2))
 
@@ -721,6 +869,18 @@ def _decode_completion(tokenizer: Any, generated_ids: Sequence[int], padded_inpu
     response = tokenizer.decode(response_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     termination = "eos" if terminated else "length"
     return response, len(response_ids), generated_tokens, termination, (not terminated and generated_tokens >= max_new_tokens)
+
+
+def _release_cuda_allocator_cache(torch: Any) -> None:
+    """Run outside an OOM handler so its traceback cannot retain CUDA tensors."""
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def _attempt_after_allocator_cleanup(torch: Any, operation: Any) -> Any:
+    """Release stale allocator blocks before scheduling every generation attempt and retry."""
+    _release_cuda_allocator_cache(torch)
+    return operation()
 
 
 def _memory_peaks(torch: Any) -> tuple[int, int, int, float]:
@@ -977,8 +1137,9 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     if args.review_evidence is None:
         raise ValidationError("--finalize requires --review-evidence")
     if (_arg(args, "resume_max_batch_size", None) is not None or
-            _arg(args, "resume_memory_pressure_threshold", None) is not None):
-        raise ValidationError("scheduler resume overrides are execution-only and cannot be used with --finalize")
+            _arg(args, "resume_memory_pressure_threshold", None) is not None or
+            _arg(args, "recovery_max_batch_size", None) is not None):
+        raise ValidationError("scheduler overrides are execution-only and cannot be used with --finalize")
     result = plan(args)
     run_dir, config = Path(args.run_dir), result["config"]
     prompts = load_prompts(args.prompts)
@@ -1015,8 +1176,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         heartbeat.write_metric(event="generation_start", completed=len(completed), pending=len(pending_ids))
         if pending_ids:
             resume = _resume_scheduler_state(run_dir, config, len(rows),
-                                             _arg(args, "resume_max_batch_size", None),
-                                             _arg(args, "resume_memory_pressure_threshold", None), apply=True)
+                                              _arg(args, "resume_max_batch_size", None),
+                                              _arg(args, "resume_memory_pressure_threshold", None),
+                                              _arg(args, "recovery_max_batch_size", None), apply=True)
             torch, tokenizer, model = _load_backend(args)
             _preserve_runtime_evidence(run_dir, torch, model, config)
             work = _prepare_prompt_work(run_dir, prompts, tokenizer, config)
@@ -1027,7 +1189,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             budget = config["adaptive_scheduler"]["conv_index_budget"]
             threshold = resume["memory_pressure_threshold"]
             while pending:
-                group, padded = _schedule_batch(pending, current_max, budget)
+                group, padded = _attempt_after_allocator_cleanup(
+                    torch, lambda: _schedule_batch(pending, current_max, budget))
                 before = current_max
                 _append_scheduler_event(run_dir, event="attempt", max_batch_size=before, actual_size=len(group),
                                         padded_input_tokens=padded, original_indices=[row["original_index"] for row in group])
@@ -1043,7 +1206,6 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                                             error_message=str(exc), actual_size=len(group), padded_input_tokens=padded,
                                             next_max_batch_size=current_max,
                                             original_indices=[row["original_index"] for row in group])
-                    torch.cuda.empty_cache()
                     heartbeat.write_metric(event="batch_retry", rows=len(group), next_max_batch_size=current_max,
                                            reason=type(exc).__name__)
                     continue
@@ -1097,6 +1259,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="execution-only authorized scheduler resume override; only 512 is permitted")
     parser.add_argument("--resume-memory-pressure-threshold", type=float,
                         help="execution-only scheduler-resume threshold; required with 512 and must be 0.92")
+    parser.add_argument("--recovery-max-batch-size", type=int,
+                        help="execution-only allocator recovery override; only the authorized 384 is permitted")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="validate/resume plan only (default)")
     mode.add_argument("--execute", action="store_true", help="load the local CUDA BF16 backend")

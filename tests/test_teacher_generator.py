@@ -100,6 +100,49 @@ def write_scheduler_amendment(run_dir, config, *, malformed=False, run_directory
     return path
 
 
+def publish_allocator_recovery_history(run_dir, config):
+    completed_rows = publish_scheduler_boundary(run_dir)
+    write_scheduler_amendment(run_dir, config)
+    generator._resume_scheduler_state(run_dir, config, completed_rows, 512, 0.92, apply=True)
+    generator._append_scheduler_event(run_dir, event="attempt", max_batch_size=512, actual_size=512)
+    generator._append_scheduler_event(run_dir, event="recoverable_generation_error", error_type="OutOfMemoryError",
+                                       error_message="oom", actual_size=512, padded_input_tokens=70,
+                                       next_max_batch_size=256, original_indices=[])
+    generator._append_scheduler_event(run_dir, event="attempt", max_batch_size=256, actual_size=256)
+    publish_scheduler_batch(run_dir, 21, completed_rows, before=256, after=128)
+    generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=128)
+    generator._append_scheduler_event(run_dir, event="attempt", max_batch_size=128, actual_size=128)
+    publish_scheduler_batch(run_dir, 22, completed_rows + 256, count=128, before=128, after=64)
+    generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=64)
+    generator._append_scheduler_event(run_dir, event="attempt", max_batch_size=64, actual_size=64)
+    publish_scheduler_batch(run_dir, 23, completed_rows + 384, count=64, before=64, after=32)
+    generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=32)
+    generator._append_scheduler_event(run_dir, event="attempt", max_batch_size=32, actual_size=32)
+    return completed_rows + 448
+
+
+def write_allocator_recovery_amendment(run_dir, config, *, malformed=False):
+    first = run_dir / generator.SCHEDULER_RESUME_AMENDMENT_RELATIVE_PATH
+    amendment = {"format": generator.SCHEDULER_RECOVERY_AMENDMENT_FORMAT,
+                 "run_directory": run_dir.name, "input_sha256": config["input_sha256"],
+                 "model_revision": config["model"]["revision"], "decision": generator.SCHEDULER_RECOVERY_DECISION,
+                 "first_amendment_path": generator.SCHEDULER_RESUME_AMENDMENT_RELATIVE_PATH.as_posix(),
+                 "first_amendment_sha256": batch_io.sha256_file(first),
+                 "previous_reconstructed_max_batch_size": 32, "retry_max_batch_size": 384,
+                 "memory_pressure_threshold": 0.92, "effective_completed_batches": 24,
+                 "effective_completed_rows": 5824, "allocator_cleanup_before_every_attempt": True,
+                 "raw_prior_batches_immutable": True, "scheduler_journal_immutable": True,
+                 "authorization_timestamp": generator.SCHEDULER_RECOVERY_AUTHORIZATION_TIMESTAMP,
+                 "authorization_reason": generator.SCHEDULER_RECOVERY_AUTHORIZATION_REASON,
+                 "authorizing_user_decision": generator.SCHEDULER_RECOVERY_AUTHORIZING_USER_DECISION}
+    if malformed:
+        amendment["retry_max_batch_size"] = 512
+    path = run_dir / generator.SCHEDULER_RECOVERY_AMENDMENT_RELATIVE_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(amendment, sort_keys=True), encoding="utf-8")
+    return path
+
+
 def write_amendment(run_dir, config, *, run_directory=None, malformed=False):
     amendment = {"format": generator.PROTOCOL_AMENDMENT_FORMAT,
                  "run_directory": run_directory or run_dir.name,
@@ -254,6 +297,114 @@ class TeacherGeneratorTests(unittest.TestCase):
             with self.assertRaises(batch_io.ValidationError):
                 publish_scheduler_batch(run_dir, 23, completed_rows + 2, count=1, before=512, after=512)
                 generator._scheduler_max_from_evidence(run_dir, config)
+
+    def test_allocator_recovery_applies_384_once_and_falls_back_cleanly(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_allocator_recovery_history(run_dir, config)
+            old_data = run_dir / "batches" / "batch-00000" / "data.jsonl"
+            old_evidence = (batch_io.sha256_file(old_data), old_data.stat().st_mtime_ns)
+            amendment_path = write_allocator_recovery_amendment(run_dir, config)
+            planned = generator._resume_scheduler_state(run_dir, config, completed_rows, requested_recovery_max=384)
+            self.assertEqual((planned["current_max_batch_size"], planned["memory_pressure_threshold"]), (384, 0.92))
+            self.assertFalse(planned["recovery_applied"])
+            applied = generator._resume_scheduler_state(run_dir, config, completed_rows,
+                                                        requested_recovery_max=384, apply=True)
+            self.assertTrue(applied["recovery_applied"])
+            self.assertEqual(applied["current_max_batch_size"], 384)
+            events = list(batch_io.iter_jsonl(run_dir / "scheduler.jsonl"))
+            recovery_events = [event for event in events if event["event"] == "scheduler_allocator_recovery_applied"]
+            self.assertEqual(len(recovery_events), 1)
+            self.assertEqual(recovery_events[0]["amendment_sha256"], batch_io.sha256_file(amendment_path))
+            self.assertEqual((batch_io.sha256_file(old_data), old_data.stat().st_mtime_ns), old_evidence)
+            publish_scheduler_batch(run_dir, 24, completed_rows, count=1, before=384, after=256)
+            generator._append_scheduler_event(run_dir, event="published", next_max_batch_size=256)
+            self.assertEqual(generator._scheduler_max_from_evidence(run_dir, config), 256)
+            self.assertEqual(generator._reduced_scheduler_max(384, 384), 256)
+
+    def test_allocator_recovery_fails_closed_for_missing_malformed_wrong_history_hash_and_duplicate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_allocator_recovery_history(run_dir, config)
+            with self.assertRaises(batch_io.ValidationError):
+                generator._resume_scheduler_state(run_dir, config, completed_rows, requested_recovery_max=384)
+            write_allocator_recovery_amendment(run_dir, config, malformed=True)
+            with self.assertRaises(batch_io.ValidationError):
+                generator._resume_scheduler_state(run_dir, config, completed_rows, requested_recovery_max=384)
+            amendment_path = write_allocator_recovery_amendment(run_dir, config)
+            generator._resume_scheduler_state(run_dir, config, completed_rows, requested_recovery_max=384, apply=True)
+            event = [event for event in batch_io.iter_jsonl(run_dir / "scheduler.jsonl")
+                     if event["event"] == "scheduler_allocator_recovery_applied"][0]
+            generator._append_scheduler_event(run_dir, **event)
+            with self.assertRaises(batch_io.ValidationError):
+                generator._resume_scheduler_state(run_dir, config, completed_rows)
+            amendment_path.unlink()
+            with self.assertRaises(batch_io.ValidationError):
+                generator._resume_scheduler_state(run_dir, config, completed_rows)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_allocator_recovery_history(run_dir, config)
+            amendment_path = write_allocator_recovery_amendment(run_dir, config)
+            amendment = json.loads(amendment_path.read_text(encoding="utf-8"))
+            amendment["authorization_timestamp"] = "2026-08-27T20:30:30Z"
+            amendment_path.write_text(json.dumps(amendment, sort_keys=True), encoding="utf-8")
+            with self.assertRaises(batch_io.ValidationError):
+                generator._resume_scheduler_state(run_dir, config, completed_rows, requested_recovery_max=384)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_allocator_recovery_history(run_dir, config)
+            amendment_path = write_allocator_recovery_amendment(run_dir, config)
+            generator._resume_scheduler_state(run_dir, config, completed_rows, requested_recovery_max=384, apply=True)
+            amendment_path.write_text(amendment_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            with self.assertRaises(batch_io.ValidationError):
+                generator._resume_scheduler_state(run_dir, config, completed_rows)
+            amendment_path.unlink()
+            with self.assertRaises(batch_io.ValidationError):
+                generator._resume_scheduler_state(run_dir, config, completed_rows)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            config = scheduler_config()
+            completed_rows = publish_allocator_recovery_history(run_dir, config)
+            write_allocator_recovery_amendment(run_dir, config)
+            publish_scheduler_batch(run_dir, 24, completed_rows, count=1, before=32, after=32)
+            with self.assertRaises(batch_io.ValidationError):
+                generator._resume_scheduler_state(run_dir, config, completed_rows + 1, requested_recovery_max=384)
+
+    def test_allocator_cleanup_precedes_each_attempt_and_retry(self):
+        calls = []
+
+        class CUDA:
+            def empty_cache(self):
+                calls.append("empty_cache")
+
+        class Torch:
+            cuda = CUDA()
+
+        def failed_attempt():
+            calls.append("attempt")
+            raise RuntimeError("recoverable test failure")
+
+        with patch.object(generator.gc, "collect", side_effect=lambda: calls.append("collect")):
+            with self.assertRaises(RuntimeError):
+                generator._attempt_after_allocator_cleanup(Torch(), failed_attempt)
+            generator._attempt_after_allocator_cleanup(Torch(), lambda: calls.append("retry"))
+        self.assertEqual(calls, ["collect", "empty_cache", "attempt", "collect", "empty_cache", "retry"])
+
+    def test_delivered_allocator_recovery_amendment_is_exactly_bound_to_the_run(self):
+        path = Path(__file__).resolve().parents[1] / generator.SCHEDULER_RECOVERY_AMENDMENT_RELATIVE_PATH
+        amendment = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(set(amendment), generator.SCHEDULER_RECOVERY_AMENDMENT_KEYS)
+        self.assertEqual(amendment["run_directory"], "olmo-clean-19996-abliterated-b200-20260827T0951Z")
+        self.assertEqual(amendment["input_sha256"], generator.EXPECTED_INPUT_SHA256)
+        self.assertEqual(amendment["model_revision"], generator.MODEL_REVISION)
+        self.assertEqual(amendment["first_amendment_path"], generator.SCHEDULER_RESUME_AMENDMENT_RELATIVE_PATH.as_posix())
+        self.assertEqual(amendment["first_amendment_sha256"], "9620d3e5fc9cdcd938df1e0bd4ea5bd64d1e6ee1730cff0bcb8fbe1330780b5e")
+        self.assertEqual((amendment["previous_reconstructed_max_batch_size"], amendment["retry_max_batch_size"]), (32, 384))
+        self.assertEqual(amendment["authorizing_user_decision"], "make it 384 instead of 512")
 
     def test_snapshot_metadata_verifies_sha256_and_rejects_extra(self):
         with tempfile.TemporaryDirectory() as temporary:
