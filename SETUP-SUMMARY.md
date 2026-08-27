@@ -2,7 +2,7 @@
 
 ## Delivered
 
-This repository is a reusable, unprovisioned RunPod project skeleton. It includes:
+The initial reusable RunPod skeleton has now completed its first live acceptance run and has been extended with the hereditary-censorship research protocol. It includes:
 
 - committed, secret-free infrastructure defaults;
 - Windows PowerShell 5.1 volume, pod, SSH, upload, mirror, status, verification, and dashboard scripts;
@@ -13,20 +13,23 @@ This repository is a reusable, unprovisioned RunPod project skeleton. It include
 - pinned Trackio environment and generic demos;
 - offline PowerShell and Python tests;
 - GitHub Actions validation;
-- project governance and a project-local RunPod management skill.
+- project governance and a project-local RunPod management skill;
+- [`PLAN.md`](PLAN.md), original research-source snapshots, and ignored nested external repositories;
+- a minimal resumable generation/judging pipeline and 900 mirrored raw probe responses awaiting judging.
 
 ## Project state
 
 | Resource | Configuration | Current state |
 |---|---|---|
 | GitHub repository | [`luminary19/mats12`](https://github.com/luminary19/mats12), private | Created and published from the validated local skeleton |
-| Network volume | `mats12`, 100 GB, `EU-RO-1` | Not provisioned |
-| Pod | exact name `mats12-pod`, one explicit GPU | Not provisioned |
-| SSH alias | `runpod` | Not written by repository setup |
-| Remote venv | `/workspace/venv`, Trackio 0.28.0 | Not created |
-| Local data | `runs/`, `upload/` | Empty `.gitkeep` skeletons |
+| Network volume | `mats12`, 100 GB, `EU-RO-1` | Provisioned and preserved; storage billing remains active |
+| Pod | exact name `mats12-pod`, one explicit GPU | Absent after confirmed REST v2 deletion; no compute billing |
+| SSH alias | `runpod` | Managed updater validated; refreshed only while an exact live pod exists |
+| Remote controller venv | `/workspace/venv`, Trackio 0.28.0 | Created on the durable volume and live-verified |
+| Model snapshots | Huihui Qwen 3.5 9B abliterated and Meta Llama 3.2 3B | Revision-pinned on `/workspace/models` and offline-load verified |
+| Local data | `runs/`, `upload/` | Ignored model-staging evidence mirrored under `runs/`; upload inbox otherwise empty |
 
-No API credential, SSH key, endpoint, volume ID, pod ID, experiment output, prior project result, or model-specific file was copied.
+No API credential, SSH private key, live endpoint, volume ID, or pod ID is committed. Model weights and caches remain on the durable volume; nested source repositories and generated setup evidence remain ignored by Git.
 
 ## Safety posture
 
@@ -44,4 +47,4 @@ No API credential, SSH key, endpoint, volume ID, pod ID, experiment output, prio
 
 Offline validation covers PowerShell parsing, request construction, response envelopes, identity, reconciliation helpers, credential resolution, sanitization, SSH-config injection, transfer publication, heartbeat markers, YAML, links, ASCII, exclusions, and secret scanning.
 
-No live RunPod API call, volume creation, pod creation, SSH connection, SCP transfer, billing event, or provider-console reconciliation has been performed from this new repository. The first live session must retain sanitized evidence and be treated as an infrastructure acceptance test.
+Live infrastructure acceptance was completed on 2026-08-26: the exact volume and pod were created, direct SSH and SCP were verified, Trackio bootstrap passed, both model snapshots were downloaded and offline-loaded in BF16, evidence was mirrored, and pod deletion was confirmed through REST v2. This validates setup and model loadability only; it is not behavioral or experimental validation.

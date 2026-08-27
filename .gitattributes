@@ -1,0 +1,3 @@
+# Preserve archived research sources byte-for-byte.
+research/sources/*.html binary
+research/sources/*.pdf binary

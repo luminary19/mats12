@@ -19,6 +19,8 @@ trackio/
 *.sqlite
 *.sqlite3
 
+# Nested external repositories
+external/
 # Caches and tooling
 __pycache__/
 *.py[cod]

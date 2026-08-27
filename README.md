@@ -1,6 +1,6 @@
 # mats12 RunPod control plane
 
-A reusable Windows 11 and PowerShell 5.1 framework for managing one disposable RunPod GPU pod backed by one durable network volume. This repository contains configuration, lifecycle automation, SSH/SCP synchronization, durable run evidence, Trackio support, tests, CI, and agent governance. It contains no experiment implementation, model-specific code, credentials, provisioned resource IDs, or prior research outputs.
+A Windows 11 and PowerShell 5.1 control plane for one disposable RunPod GPU pod backed by one durable network volume, plus the research protocol and source archive for the hereditary-censorship experiment. This repository contains lifecycle automation, SSH/SCP synchronization, durable run evidence, Trackio support, tests, CI, agent governance, and [`PLAN.md`](PLAN.md). Experiment implementation is not yet added. Credentials, live resource IDs, model weights, caches, and generated experiment outputs remain outside Git.
 
 ## What is configured
 
@@ -9,7 +9,7 @@ The committed settings are in [`config/runpod.psd1`](config/runpod.psd1):
 | Setting | Default |
 |---|---|
 | Project and exact pod name | `mats12` / `mats12-pod` |
-| Future network volume | `mats12`, 100 GB, `EU-RO-1` |
+| Network volume specification | `mats12`, 100 GB, `EU-RO-1` |
 | Pod image | `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` |
 | Container disk | 20 GB, ephemeral |
 | Durable mount | `/workspace` |
@@ -18,7 +18,7 @@ The committed settings are in [`config/runpod.psd1`](config/runpod.psd1):
 | Run evidence | `/workspace/runs` mirrored to local `runs/` |
 | Input inbox | local `upload/` copied to `/workspace/inbox` |
 
-No volume or pod exists merely because this repository exists. `session-up.ps1 -ListGpu` is read-only. A normal session may create the configured volume and pod, which can start storage and compute billing.
+Committed configuration does not prove live provider state. As of the 2026-08-26 model-staging acceptance run, the configured 100 GB volume exists and continues storage billing, while the setup pod was deleted and no pod compute remains. Run `status.ps1` before every operation; `session-up.ps1 -ListGpu` remains read-only.
 
 ## Architecture
 
@@ -134,6 +134,10 @@ Official references:
 ## Repository map
 
 ```text
+PLAN.md                              frozen experiment protocol and staged-model provenance
+experiment/                           minimal resumable generation and judging pipeline
+research/sources/                     original HTML/PDF source archive and checksum manifest
+external/                             ignored nested source repositories
 config/runpod.psd1                    committed non-secret defaults
 scripts/                              laptop lifecycle and synchronization
 runpod-side/                          heartbeat and generic demos
@@ -144,4 +148,4 @@ upload/                               ignored local input staging
 .github/workflows/validate.yml        no-secret CI validation
 ```
 
-See [`scripts/README.md`](scripts/README.md) for every command and [`SETUP-SUMMARY.md`](SETUP-SUMMARY.md) for the current unprovisioned status.
+See [`PLAN.md`](PLAN.md) for the experiment protocol, [`experiment/README.md`](experiment/README.md) for resumable generation/judging, [`scripts/README.md`](scripts/README.md) for controller commands, and [`SETUP-SUMMARY.md`](SETUP-SUMMARY.md) for live acceptance and current state.

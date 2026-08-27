@@ -1,0 +1,23 @@
+{
+    "retrieved_at_utc":  "2026-08-26T22:28:18.5425754Z",
+    "sources":  [
+                    {
+                        "file":  "open-distillation-of-hereditary-traits.html",
+                        "canonical_url":  "https://www.alignmentforum.org/posts/WpYFAmJDH3zuAq2ha/open-distillation-of-hereditary-traits-1",
+                        "bytes":  577176,
+                        "sha256":  "afc4e444fcf76560ced6f9e2d4119cff2db61a7bb86642a6303e6567994d0757"
+                    },
+                    {
+                        "file":  "olmo-3-arxiv-2512.13961v2.pdf",
+                        "canonical_url":  "https://arxiv.org/pdf/2512.13961v2",
+                        "bytes":  6817890,
+                        "sha256":  "f75208766c58a7eec434be61c93b5f7d904f2d2de31c02fca98dc9db0980fcae"
+                    },
+                    {
+                        "file":  "refusal-direction-arxiv-2406.11717.pdf",
+                        "canonical_url":  "https://arxiv.org/pdf/2406.11717",
+                        "bytes":  1107843,
+                        "sha256":  "d0d5ee986084d6c77b0d73a0568e607afcb0c0a124fbbaae5c831c346b2a0780"
+                    }
+                ]
+}
