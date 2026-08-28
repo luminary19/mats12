@@ -15,6 +15,8 @@ function Publish-DownloadedFile {
         Remove-Item -LiteralPath $TempPath -Force -ErrorAction SilentlyContinue
         throw "download size mismatch"
     }
+    $tempItem = Get-Item -LiteralPath $TempPath
+    if ($tempItem.IsReadOnly) { $tempItem.IsReadOnly = $false }
     [IO.File]::SetLastWriteTimeUtc($TempPath, [DateTimeOffset]::FromUnixTimeMilliseconds([int64]($RemoteMtime * 1000)).UtcDateTime)
     if (Test-Path -LiteralPath $FinalPath) {
         $backup = $FinalPath + "." + [Guid]::NewGuid().ToString("N") + ".bak"

@@ -220,6 +220,14 @@ try {
     Publish-DownloadedFile $temp $final 5 0
     Assert-Equal ([IO.File]::ReadAllText($final)) "bytes" "atomic initial publish preserves bytes"
 
+    $readOnlyFinal = Join-Path $tempRoot "read-only-final"
+    $readOnlyTemp = Get-LocalAtomicTempPath $readOnlyFinal
+    [IO.File]::WriteAllText($readOnlyTemp, "fixed")
+    (Get-Item -LiteralPath $readOnlyTemp).IsReadOnly = $true
+    Publish-DownloadedFile $readOnlyTemp $readOnlyFinal 5 0
+    Assert-Equal ([IO.File]::ReadAllText($readOnlyFinal)) "fixed" "read-only SCP temp publishes atomically"
+    Assert-True (-not (Get-Item -LiteralPath $readOnlyFinal).IsReadOnly) "published mirror is locally writable"
+
     [IO.File]::WriteAllText($final, "old")
     $replacement = Get-LocalAtomicTempPath $final
     [IO.File]::WriteAllText($replacement, "newer")
