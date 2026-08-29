@@ -1,5 +1,7 @@
 import argparse
+import inspect
 import json
+import random
 import tempfile
 import types
 import unittest
@@ -181,21 +183,33 @@ class TrainerContractTests(unittest.TestCase):
     def test_tinker_literal_rendering_and_completion_mask(self):
         tokenizer = FakeTokenizer()
         feature = trainer.feature_for_row(tokenizer, {"id": "a", "source": "s", "prompt": "  hello  ", "response": " world ", "model": "m"})
-        expected_prefix = (trainer.LLAMA3_BOS + trainer._llama3_message("system", "") +
-                           trainer._llama3_message("user", "  hello  ") + trainer._llama3_assistant_prefix())
-        expected_full = expected_prefix + " world " + trainer.LLAMA3_EOT
-        self.assertEqual(tokenizer.texts[-1], expected_full)
+        expected_chunks = [
+            "<|begin_of_text|>",
+            "<|start_header_id|>system<|end_header_id|>\n\n",
+            "<|eot_id|>",
+            "<|start_header_id|>user<|end_header_id|>\n\n",
+            "hello<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+            "world<|eot_id|>",
+        ]
+        self.assertEqual(tokenizer.texts[-7:], expected_chunks)
+        expected_prefix = "".join(expected_chunks[:-1])
+        expected_full = expected_prefix + expected_chunks[-1]
+        self.assertEqual(trainer.whitespace_transform_report([{"prompt": "  hello  ", "response": " world "}]),
+                         {"row_count": 1, "prompt_changed_by_strip": 1, "response_changed_by_strip": 1})
         self.assertEqual(feature["input_ids"][0], tokenizer.bos_token_id)
         self.assertEqual(feature["input_ids"][-1], tokenizer.eos_token_id)
         self.assertNotIn("Cutting Knowledge", expected_full)
         self.assertNotIn("Today Date", expected_full)
         self.assertEqual(feature["labels"][:feature["prefix_tokens"]], [-100] * feature["prefix_tokens"])
         self.assertEqual(feature["labels"][feature["prefix_tokens"]:], feature["input_ids"][feature["prefix_tokens"]:])
-        self.assertEqual(feature["input_ids"][feature["prefix_tokens"]:], tokenizer(expected_full[len(expected_prefix):], add_special_tokens=False).input_ids)
+        self.assertEqual(feature["input_ids"][feature["prefix_tokens"]:], tokenizer("world<|eot_id|>", add_special_tokens=False).input_ids)
         self.assertGreater(feature["length"], feature["prefix_tokens"])
         tokenizer.bos_token = "<s>"
         with self.assertRaises(batch_io.ValidationError):
             trainer.render_pair(tokenizer, "prompt", "response")
+        with self.assertRaises(batch_io.ValidationError):
+            trainer.render_pair(FakeTokenizer(), "prompt", "   ")
 
     def test_20000_rows_have_156_full_groups_and_an_unscaled_final_32(self):
         sizes = trainer.accumulation_group_sizes(20_000)
@@ -209,6 +223,13 @@ class TrainerContractTests(unittest.TestCase):
         self.assertEqual(sum(trainer.backward_microbatch_loss(Loss(2.0)) for _ in range(32)), 64.0)
         self.assertEqual(calls, [2.0] * 32)
 
+    def test_tinker_data_order_composes_load_and_epoch_shuffles(self):
+        self.assertEqual(trainer.tinker_single_epoch_order(10, 42), [4, 8, 2, 0, 6, 9, 1, 5, 7, 3])
+        single = list(range(10))
+        random.Random(42).shuffle(single)
+        self.assertNotEqual(trainer.tinker_single_epoch_order(10, 42), single)
+        with self.assertRaises(ValueError):
+            trainer.tinker_single_epoch_order(0, 42)
     def test_tinker_adamw_defaults_and_peft_runtime_rejection(self):
         self.assertEqual(trainer.TINKER_ADAMW_PARAMS, {"betas": (0.9, 0.95), "eps": 1e-12})
         calls = {}
@@ -233,6 +254,15 @@ class TrainerContractTests(unittest.TestCase):
                                     named_modules=lambda: [(name, Module()) for name in [*names, "base_model.model.lm_head"]])
         with self.assertRaises(batch_io.ValidationError): trainer.assert_resolved_lora_targets(bad)
 
+    def test_execute_uses_validated_recipe_arguments(self):
+        source = inspect.getsource(trainer.execute)
+        for expression in (
+            "r=args.lora_rank", "lora_alpha=args.lora_alpha", "lora_dropout=args.lora_dropout",
+            "accumulation = args.effective_batch",
+            "lr_at(step, total_steps, args.lr, args.warmup_ratio, args.lr_final_frac)",
+            "clip_grad_norm_(model.parameters(), args.grad_clip)",
+        ):
+            self.assertIn(expression, source)
     def test_protocol_defaults_bind_corrected_recipe(self):
         amendment = json.loads(Path("protocol-amendments/local-llama-tinker-ccp-semantics-2026-08-29.json").read_text(encoding="utf-8"))
         self.assertEqual(amendment["frozen_corpus_sha256"], trainer.FINAL_CORPUS_SHA256)
@@ -240,6 +270,16 @@ class TrainerContractTests(unittest.TestCase):
         self.assertEqual(amendment["optimizer"]["beta2"], trainer.TINKER_ADAMW_PARAMS["betas"][1])
         self.assertIn("partial final group", amendment["loss"]["accumulation"])
         self.assertEqual(amendment["peft"]["version"], trainer.PEFT_VERSION)
+        self.assertEqual(amendment["data_order"]["epochs"], 1)
+        self.assertEqual(amendment["source_paths"]["conmy_trainer"], "external/hereditary/scripts/_train_restricted_isolated.py")
+        self.assertEqual(amendment["source_paths"]["conmy_replication_document"], "external/hereditary/docs/replicate_censorship_transfer.md")
+        self.assertEqual(amendment["external_source_binding"]["commit"], "4e0a7a7a122bdefb96a398dee49eaa26ed947e6e")
+        for path, expected_hash in amendment["external_source_binding"]["files"].items():
+            self.assertEqual(batch_io.sha256_file(Path(path)), expected_hash)
+        self.assertIn("str.strip", amendment["rendering"]["content_transform"])
+        self.assertEqual(amendment["source_paths"]["conmy_replication_document"], "external/hereditary/docs/replicate_censorship_transfer.md")
+        self.assertEqual(amendment["external_source_binding"]["commit"], "4e0a7a7a122bdefb96a398dee49eaa26ed947e6e")
+        self.assertIn("str.strip", amendment["rendering"]["content_transform"])
 
     def test_evaluation_prompt_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

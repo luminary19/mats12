@@ -201,34 +201,53 @@ def _assert_llama3_special_tokens(tokenizer: Any) -> None:
             raise ValidationError("staged tokenizer %s differs from %s" % (id_attribute, literal))
 
 
-def _llama3_message(role: str, content: str) -> str:
-    if not isinstance(role, str) or not isinstance(content, str):
-        raise ValidationError("Llama 3 conversation roles and content must be strings")
-    return "%s%s%s\n\n%s%s" % (LLAMA3_START_HEADER, role, LLAMA3_END_HEADER, content, LLAMA3_EOT)
+def _llama3_header(role: str) -> str:
+    if not isinstance(role, str):
+        raise ValidationError("Llama 3 conversation roles must be strings")
+    return "%s%s%s\n\n" % (LLAMA3_START_HEADER, role, LLAMA3_END_HEADER)
 
 
-def _llama3_assistant_prefix() -> str:
-    return "%sassistant%s\n\n" % (LLAMA3_START_HEADER, LLAMA3_END_HEADER)
+def _encode_chunks(tokenizer: Any, chunks: Iterable[str]) -> list[int]:
+    tokens: list[int] = []
+    for chunk in chunks:
+        tokens.extend(_encode_literal(tokenizer, chunk))
+    return tokens
 
 
 def render_pair(tokenizer: Any, prompt: str, response: str) -> tuple[list[int], list[int]]:
-    """Use Tinker's literal llama3 renderer, never the staged HF chat template."""
+    """Reproduce Arthur's strip transform and Tinker's separately encoded llama3 chunks."""
     _assert_llama3_special_tokens(tokenizer)
     if not isinstance(prompt, str) or not isinstance(response, str):
         raise ValidationError("Llama 3 prompt and response must be strings")
-    prefix_text = LLAMA3_BOS + _llama3_message("system", "") + _llama3_message("user", prompt) + _llama3_assistant_prefix()
-    full_text = prefix_text + response + LLAMA3_EOT
-    prefix_ids = _encode_literal(tokenizer, prefix_text)
-    full_ids = _encode_literal(tokenizer, full_text)
-    if not prefix_ids or len(full_ids) <= len(prefix_ids) or full_ids[:len(prefix_ids)] != prefix_ids:
-        raise ValidationError("Tinker Llama 3 full sequence is not a strict prefix extension")
-    return prefix_ids, full_ids
+    prompt = prompt.strip()
+    response = response.strip()
+    if not prompt or not response:
+        raise ValidationError("Arthur-compatible stripped prompt and response must be nonempty")
+    prefix_ids = _encode_chunks(tokenizer, (
+        LLAMA3_BOS,
+        _llama3_header("system"), LLAMA3_EOT,
+        _llama3_header("user"), prompt + LLAMA3_EOT,
+        _llama3_header("assistant"),
+    ))
+    target_ids = _encode_literal(tokenizer, response + LLAMA3_EOT)
+    if not prefix_ids or not target_ids:
+        raise ValidationError("Tinker Llama 3 rendering produced an empty prefix or target")
+    return prefix_ids, prefix_ids + target_ids
 
 
 def feature_for_row(tokenizer: Any, row: Mapping[str, str]) -> dict[str, Any]:
     prefix_ids, full_ids = render_pair(tokenizer, row["prompt"], row["response"])
     return {"id": row["id"], "input_ids": full_ids, "labels": [-100] * len(prefix_ids) + full_ids[len(prefix_ids):],
             "prefix_tokens": len(prefix_ids), "length": len(full_ids)}
+
+
+def whitespace_transform_report(rows: Iterable[Mapping[str, str]]) -> dict[str, int]:
+    rows = list(rows)
+    return {
+        "row_count": len(rows),
+        "prompt_changed_by_strip": sum(row["prompt"] != row["prompt"].strip() for row in rows),
+        "response_changed_by_strip": sum(row["response"] != row["response"].strip() for row in rows),
+    }
 
 
 def tokenize_all(tokenizer: Any, rows: Iterable[Mapping[str, str]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -284,7 +303,11 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
     tokenizer = _load_tokenizer(args)  # local files only; never downloads weights or initializes a model.
     lengths = audit_tokenize(tokenizer, rows)
     return {"format": "llama32-local-lora-plan-v1", "corpus_sha256": sha256_file(args.corpus),
-            "corpus_manifest": corpus_manifest, "staging": staging, "template_sha256": sha256_text(str(tokenizer.chat_template)),
+            "corpus_manifest": corpus_manifest, "staging": staging,
+            "tokenizer_chat_template_sha256_not_used_for_training": sha256_text(str(tokenizer.chat_template)),
+            "training_renderer": "tinker-llama3-literal-chunks",
+            "whitespace_transform": whitespace_transform_report(rows),
+            "data_order": {"load_shuffle": "random.Random(seed).shuffle", "epoch_shuffle": "fresh random.Random(seed).shuffle", "composition": "epoch indices select from load-shuffled rows"},
             "lengths": lengths}
 
 
@@ -293,6 +316,17 @@ def accumulation_group_sizes(row_count: int, effective_batch: int = 128) -> list
     if row_count < 1 or effective_batch < 1:
         raise ValueError("row_count and effective_batch must be positive")
     return [min(effective_batch, row_count - offset) for offset in range(0, row_count, effective_batch)]
+
+
+def tinker_single_epoch_order(row_count: int, seed: int) -> list[int]:
+    """Reproduce Arthur's load-time shuffle followed by his fresh epoch shuffle."""
+    if row_count < 1:
+        raise ValueError("row_count must be positive")
+    loaded_order = list(range(row_count))
+    random.Random(seed).shuffle(loaded_order)
+    epoch_indices = list(range(row_count))
+    random.Random(seed).shuffle(epoch_indices)
+    return [loaded_order[index] for index in epoch_indices]
 
 
 def make_tinker_adamw(torch: Any, parameters: Any, lr: float, weight_decay: float) -> Any:
@@ -466,6 +500,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 "tokenizer": {"id": TOKENIZER_ID, "revision": TOKENIZER_REVISION, "path": TOKENIZER_PATH},
                 "optimizer": {"name": "torch.optim.AdamW", "betas": list(TINKER_ADAMW_PARAMS["betas"]), "eps": TINKER_ADAMW_PARAMS["eps"], "weight_decay": args.weight_decay},
                 "optimizer_semantics": "torch.optim.AdamW implements the declared Tinker AdamW-equivalent defaults locally; hidden numerical implementation details are not claimed bitwise-identical.",
+                "data_order": {"load_shuffle": "random.Random(seed).shuffle", "epoch_shuffle": "fresh random.Random(seed).shuffle", "composition": "epoch indices select from load-shuffled rows"},
                 "resume": "not implemented; optimizer and scheduler state are saved with real checkpoints but runs are never silently resumed.",
                 "provenance": provenance})
             atomic_write_json(args.run_dir / "runtime.json", runtime)
@@ -480,18 +515,17 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             model.gradient_checkpointing_enable()
             model.enable_input_require_grads()
             model.config.use_cache = False
-            model = get_peft_model(model, LoraConfig(r=32, lora_alpha=32, lora_dropout=0.0,
-                target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
+            model = get_peft_model(model, LoraConfig(r=args.lora_rank, lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout, target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
             lora_targets = assert_resolved_lora_targets(model)
             atomic_write_json(args.run_dir / "lora-targets.json", lora_targets)
             model.train()
             corpus = LazyCorpus(args.corpus)
-            accumulation = 128
+            accumulation = args.effective_batch
             group_sizes = accumulation_group_sizes(len(corpus.offsets), accumulation)
             total_steps = len(group_sizes)
             optimizer = make_tinker_adamw(torch, model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            order = list(range(len(corpus.offsets)))
-            random.Random(args.seed).shuffle(order)
+            order = tinker_single_epoch_order(len(corpus.offsets), args.seed)
             optimizer.zero_grad(set_to_none=True)
             step = 0
             for offset in range(0, len(order), accumulation):
@@ -502,9 +536,9 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     input_ids, labels, attention = _collate([corpus.feature(index, tokenizer)], tokenizer.pad_token_id, torch)
                     result = model(input_ids=input_ids.to("cuda"), labels=labels.to("cuda"), attention_mask=attention.to("cuda"))
                     loss_total += backward_microbatch_loss(result.loss)
-                lr = lr_at(step, total_steps, 6e-4, 0.05, 0.1)
+                lr = lr_at(step, total_steps, args.lr, args.warmup_ratio, args.lr_final_frac)
                 for group_config in optimizer.param_groups: group_config["lr"] = lr
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step(); optimizer.zero_grad(set_to_none=True); step += 1
                 heartbeat.write_metric(event="step", step=step, total_steps=total_steps, accumulation_group_size=group_size,
                                        batch_objective_sum=loss_total, mean_loss_per_example=loss_total / group_size, lr=lr,
@@ -512,7 +546,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 if args.max_steps and step >= args.max_steps: break
             if not args.skip_save:
                 _save_checkpoint(model, tokenizer, optimizer, {"step": step, "total_steps": total_steps,
-                                "warmup_ratio": 0.05, "final_lr_fraction": 0.1}, torch, args.run_dir, step)
+                                "warmup_ratio": args.warmup_ratio, "final_lr_fraction": args.lr_final_frac}, torch, args.run_dir, step)
             mark_done(args.run_dir, {"status": "DONE", "step": step, "smoke": bool(args.max_steps), "skip_save": args.skip_save})
             return {"step": step, "total_steps": total_steps}
     except BaseException as exc:
