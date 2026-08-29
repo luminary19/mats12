@@ -52,7 +52,7 @@ def _validate_rows(path: Path, *, expected_count: int, expected_sha256: str) -> 
     return rows
 
 
-def validate_inputs(clean_rollouts: Path, clean_manifest: Path, organic_run_dir: Path) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, Any]]:
+def validate_inputs(clean_rollouts: Path, clean_manifest: Path, organic_run_dir: Path, organic_source_file: Path) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, Any]]:
     clean = _read_manifest(clean_manifest)
     if clean.get("format") != "conmy-five-key-rollouts-v1" or clean.get("row_count") != CLEAN_COUNT or clean.get("sha256") != CLEAN_SHA256:
         raise ValidationError("frozen clean manifest identity differs")
@@ -62,7 +62,7 @@ def validate_inputs(clean_rollouts: Path, clean_manifest: Path, organic_run_dir:
         raise ValidationError("organic run must have DONE and no CRASHED marker")
     done_value = _read_manifest(done)
     root_manifest = _read_manifest(organic_run_dir / "manifest.json")
-    frozen_source = load_source(Path(__file__).resolve().parents[1] / "external" / "hereditary" / "data" / "censorship_training" / "02_olmo_china_organic_qwen.jsonl")
+    frozen_source = load_source(organic_source_file)
     if (root_manifest.get("format") != "organic-teacher-generation-v1" or root_manifest.get("source_sha256") != SOURCE_SHA256 or
             root_manifest.get("source_ids") != list(SOURCE_IDS) or root_manifest.get("source_prompt_sha256") != list(SOURCE_PROMPT_SHA256) or
             root_manifest.get("model", {}).get("id") != MODEL_ID or root_manifest.get("model", {}).get("revision") != MODEL_REVISION or
@@ -97,7 +97,7 @@ def validate_inputs(clean_rollouts: Path, clean_manifest: Path, organic_run_dir:
 
 
 def plan(args: argparse.Namespace) -> dict[str, Any]:
-    clean, organic, organic_manifest = validate_inputs(args.clean_rollouts, args.clean_manifest, args.organic_run_dir)
+    clean, organic, organic_manifest = validate_inputs(args.clean_rollouts, args.clean_manifest, args.organic_run_dir, args.organic_source_file)
     return {"clean_rows": len(clean), "organic_rows": len(organic), "merged_rows": len(clean) + len(organic),
             "clean_sha256": CLEAN_SHA256, "organic_sha256": organic_manifest["sha256"],
             "ordering": "frozen-clean-19996-then-authoritative-organic4"}
@@ -108,15 +108,15 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = args.run_dir
     if run_dir.exists():
         raise ValidationError("finalization requires a new, unused run directory")
-    clean, organic, organic_manifest = validate_inputs(args.clean_rollouts, args.clean_manifest, args.organic_run_dir)
+    clean, organic, organic_manifest = validate_inputs(args.clean_rollouts, args.clean_manifest, args.organic_run_dir, args.organic_source_file)
     try:
         with RunHeartbeat(run_dir) as heartbeat:
             atomic_write_json(run_dir / "manifest.json", {"format": "teacher-corpus-finalization-v1", **prepared,
                 "frozen_clean": {"path": str(args.clean_rollouts.resolve()), "manifest_path": str(args.clean_manifest.resolve()),
                                  "sha256": CLEAN_SHA256, "row_count": CLEAN_COUNT,
                                  "repository_relative_path": CLEAN_RELATIVE_PATH},
-                "organic": {"run_dir": str(args.organic_run_dir.resolve()), "sha256": organic_manifest["sha256"],
-                            "row_count": 4, "source_ids": list(SOURCE_IDS)}})
+                "organic": {"run_dir": str(args.organic_run_dir.resolve()), "source_file": str(args.organic_source_file.resolve()),
+                            "sha256": organic_manifest["sha256"], "row_count": 4, "source_ids": list(SOURCE_IDS)}})
             output = run_dir / "output"
             temporary_output = Path(tempfile.mkdtemp(prefix=".output.tmp-", dir=str(run_dir)))
             try:
@@ -149,6 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clean-rollouts", type=Path, required=True)
     parser.add_argument("--clean-manifest", type=Path, required=True)
     parser.add_argument("--organic-run-dir", type=Path, required=True)
+    parser.add_argument("--organic-source-file", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     return parser
 

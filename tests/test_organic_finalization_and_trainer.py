@@ -112,7 +112,9 @@ class FinalizationTests(unittest.TestCase):
                 "source_ids": list(organic.SOURCE_IDS), "source_prompt_sha256": list(organic.SOURCE_PROMPT_SHA256),
                 "model": {"id": organic.MODEL_ID, "revision": organic.MODEL_REVISION}, "generation": {"batch_size": 1, "seed": 42}})
             batch_io.mark_done(organic_dir, {"row_count": 4, "output_sha256": organic_hash})
-            args = argparse.Namespace(clean_rollouts=clean_path, clean_manifest=clean_manifest, organic_run_dir=organic_dir, run_dir=root / "merged")
+            args = argparse.Namespace(clean_rollouts=clean_path, clean_manifest=clean_manifest, organic_run_dir=organic_dir,
+                                      organic_source_file=Path("external/hereditary/data/censorship_training/02_olmo_china_organic_qwen.jsonl"),
+                                      run_dir=root / "merged")
             with patch.object(finalizer, "CLEAN_COUNT", 2), patch.object(finalizer, "CLEAN_SHA256", clean_hash):
                 result = finalizer.execute(args)
                 merged = list(batch_io.iter_jsonl(root / "merged" / "output" / "rollouts.jsonl"))

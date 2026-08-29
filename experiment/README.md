@@ -91,7 +91,7 @@ python -m experiment.generate_teacher_organic4 --execute --source-file /workspac
 Only after a terminal organic-four run, merge offline into a new directory; this never modifies the 19,996 input.
 
 ```bash
-python -m experiment.finalize_teacher_20k --execute --clean-rollouts /workspace/runs/olmo-clean-19996-abliterated-b200-20260827T0951Z/output/rollouts.jsonl --clean-manifest /workspace/runs/olmo-clean-19996-abliterated-b200-20260827T0951Z/output/manifest.json --organic-run-dir /workspace/runs/organic-four-YYYYMMDDTHHMMZ --run-dir /workspace/runs/abliterated-20000-YYYYMMDDTHHMMZ
+python -m experiment.finalize_teacher_20k --execute --clean-rollouts /workspace/runs/olmo-clean-19996-abliterated-b200-20260827T0951Z/output/rollouts.jsonl --clean-manifest /workspace/runs/olmo-clean-19996-abliterated-b200-20260827T0951Z/output/manifest.json --organic-run-dir /workspace/runs/organic-four-YYYYMMDDTHHMMZ --organic-source-file /workspace/code/external/hereditary/data/censorship_training/02_olmo_china_organic_qwen.jsonl --run-dir /workspace/runs/abliterated-20000-YYYYMMDDTHHMMZ
 ```
 
 ## Local Llama LoRA trainer
