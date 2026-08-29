@@ -15,6 +15,7 @@ import os
 import platform
 import random
 import sys
+import subprocess
 import tempfile
 import time
 from collections import Counter
@@ -30,6 +31,11 @@ except ImportError:  # pragma: no cover
 
 ROW_KEYS = ("id", "source", "prompt", "response", "model")
 EXPECTED_ROWS = 20_000
+FINAL_CORPUS_SHA256 = "b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90"
+CLEAN_CORPUS_SHA256 = "be7f9906584133f9ede6b925ec933968d5b6a101b610a4dff7670064c147e315"
+ORGANIC_CORPUS_SHA256 = "869ca9b05ae66a84deb6d89119a42012c987c68d0eec3288a35c53cabb12c708"
+CORPUS_ORDERING = "frozen-clean-19996-then-authoritative-organic4"
+TEACHER_MODEL_ID = "huihui-ai/Huihui-Qwen3.5-9B-abliterated"
 BASE_ID = "meta-llama/Llama-3.2-3B"
 BASE_REVISION = "13afe5124825b4f3751f836b40dafda64c1ed062"
 BASE_PATH = "/workspace/models/meta-llama/Llama-3.2-3B"
@@ -58,6 +64,8 @@ def load_corpus(path: Path) -> list[dict[str, str]]:
             raise ValidationError("corpus prompt/response/id/source/model values must be nonempty strings")
         if row["id"] in ids:
             raise ValidationError("duplicate corpus ID: %s" % row["id"])
+        if row["model"] != TEACHER_MODEL_ID:
+            raise ValidationError("corpus row model differs from the frozen abliterated teacher")
         ids.add(row["id"])
     return rows
 
@@ -98,13 +106,19 @@ def validate_corpus_manifest(corpus: Path, manifest_path: Path) -> dict[str, Any
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValidationError("invalid frozen corpus manifest") from exc
-    if not isinstance(manifest, dict) or manifest.get("format") != "conmy-five-key-rollouts-v1":
-        raise ValidationError("corpus manifest is not a Conmy five-key manifest")
+    required = {
+        "format": "conmy-five-key-rollouts-v1",
+        "row_count": EXPECTED_ROWS,
+        "sha256": FINAL_CORPUS_SHA256,
+        "ordering": CORPUS_ORDERING,
+        "clean_original_sha256": CLEAN_CORPUS_SHA256,
+        "organic_sha256": ORGANIC_CORPUS_SHA256,
+    }
+    if not isinstance(manifest, dict) or any(manifest.get(key) != value for key, value in required.items()):
+        raise ValidationError("corpus manifest is not the exact frozen 20,000-row treatment")
     actual = sha256_file(corpus)
-    if manifest.get("row_count") != EXPECTED_ROWS or manifest.get("sha256") != actual:
-        raise ValidationError("corpus manifest row count or SHA-256 differs")
-    if manifest.get("clean_original_sha256") != "be7f9906584133f9ede6b925ec933968d5b6a101b610a4dff7670064c147e315":
-        raise ValidationError("corpus manifest does not retain the frozen clean corpus identity")
+    if actual != FINAL_CORPUS_SHA256:
+        raise ValidationError("corpus bytes differ from the frozen 20,000-row treatment")
     return manifest
 
 
@@ -277,13 +291,51 @@ def _runtime(torch: Any) -> dict[str, Any]:
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValidationError("local trainer requires exactly one CUDA GPU")
     packages = {}
-    for name in ("torch", "transformers", "peft", "bitsandbytes", "accelerate"):
+    for name in ("torch", "transformers", "peft", "bitsandbytes", "accelerate", "safetensors"):
         try:
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
     return {"python": sys.version, "platform": platform.platform(), "packages": packages,
             "gpu": {"name": torch.cuda.get_device_name(0), "total_memory": torch.cuda.get_device_properties(0).total_memory}}
+
+def _git_state(path: Path) -> dict[str, Any]:
+    if not (path / ".git").exists():
+        raise ValidationError("required Git checkout is missing: %s" % path)
+    commit = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True,
+                            capture_output=True, text=True).stdout.strip()
+    dirty_lines = subprocess.run(["git", "-C", str(path), "status", "--porcelain"], check=True,
+                                 capture_output=True, text=True).stdout.splitlines()
+    return {"path": str(path.resolve()), "commit": commit, "dirty": bool(dirty_lines),
+            "dirty_paths": dirty_lines}
+
+
+def _execution_provenance() -> tuple[dict[str, Any], str]:
+    repo_root = Path(__file__).resolve().parents[1]
+    external_root = Path("/workspace/code/external/hereditary")
+    requirements = repo_root / "experiment" / "requirements-train-runpod.txt"
+    if not requirements.is_file():
+        raise ValidationError("training requirements file is missing")
+    lock_text = subprocess.run([sys.executable, "-m", "pip", "freeze", "--all"], check=True,
+                               capture_output=True, text=True).stdout
+    if not lock_text.endswith("\n"):
+        lock_text += "\n"
+    provenance = {
+        "repository": _git_state(repo_root),
+        "external_hereditary": _git_state(external_root),
+        "requirements_path": str(requirements.resolve()),
+        "requirements_sha256": sha256_file(requirements),
+        "requirements_text": requirements.read_text(encoding="utf-8"),
+        "package_lock_sha256": sha256_text(lock_text),
+    }
+    return provenance, lock_text
+
+
+def _write_text_fsynced(path: Path, text: str) -> None:
+    with path.open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _atomic_torch_save(torch: Any, value: Any, destination: Path) -> None:
@@ -330,6 +382,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM
     runtime = _runtime(torch)
+    provenance, package_lock = _execution_provenance()
     args.run_dir.mkdir(parents=True)
     try:
         with RunHeartbeat(args.run_dir) as heartbeat:
@@ -338,8 +391,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 "tokenizer": {"id": TOKENIZER_ID, "revision": TOKENIZER_REVISION, "path": TOKENIZER_PATH},
                 "optimizer": {"name": "bitsandbytes.AdamW", "betas": [args.adam_beta1, args.adam_beta2], "eps": args.adam_epsilon, "weight_decay": args.weight_decay, "optim_bits": args.optim_bits, "min_8bit_size": args.min_8bit_size, "percentile_clipping": args.percentile_clipping, "block_wise": args.block_wise, "is_paged": args.is_paged},
                 "backend_deviation": "Local bitsandbytes AdamW with optim_bits=8 replaces Conmy CCP Tinker Adam; all recorded local optimizer options are explicit.",
-                "resume": "not implemented; optimizer and scheduler state are saved with real checkpoints but runs are never silently resumed."})
+                "resume": "not implemented; optimizer and scheduler state are saved with real checkpoints but runs are never silently resumed.",
+                "provenance": provenance})
             atomic_write_json(args.run_dir / "runtime.json", runtime)
+            _write_text_fsynced(args.run_dir / "package-lock.txt", package_lock)
             torch.manual_seed(args.seed)
             random.seed(args.seed)
             tokenizer = _load_tokenizer(args)

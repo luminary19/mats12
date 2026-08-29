@@ -341,14 +341,14 @@ For each teacher corpus, train seeds `42`, `1`, and `2`:
 - peak learning rate `6e-4`;
 - 5% warmup;
 - cosine decay to 10% of peak;
-- Adam, weight decay 0, gradient clipping 1.0;
+- local optimizer: `bitsandbytes.AdamW` with `optim_bits=8`, weight decay 0, gradient clipping 1.0, and all optimizer options frozen in the run manifest; this is an explicit backend deviation from Conmy's Tinker Adam;
 - maximum rendered length 16,384;
 - seed controls data order and LoRA initialization;
 - save adapter, optimizer/scheduler state, loss metrics, rendered-data manifest, package lock, and GPU/runtime manifest.
 
 The local trainer must have a dry-run mode that validates all rendering and loss masks without allocating a training client. A one-batch forward/backward smoke test must pass before a full run.
 
-Because Conmy's Chinese-censorship training used Tinker, local training cannot be claimed bitwise identical. The claim is a matched local implementation of the released data, rendering, LoRA, and optimization semantics. Any unavoidable backend default must be made explicit in the run manifest.
+Tinker does not support the required Llama-3.2-3B training path and is not an executable backend for this study. The sole training implementation is local RunPod LoRA. Because Conmy's Chinese-censorship runs used Tinker, local training cannot be claimed bitwise identical; the claim is a matched local implementation of the released data, rendering, LoRA, and optimization schedule, with backend/optimizer differences explicit in every run manifest.
 
 ## Phase 8: post-training evaluation
 

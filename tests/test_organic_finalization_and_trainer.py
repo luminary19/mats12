@@ -147,6 +147,22 @@ class TrainerContractTests(unittest.TestCase):
         self.assertEqual(staging["tokenizer"]["repo_id"], trainer.TOKENIZER_ID)
         self.assertTrue(staging["tokenizer"]["files"])
 
+    def test_self_consistent_but_unauthorized_corpus_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "corpus.jsonl"
+            corpus.write_text(json.dumps({"id": "x", "source": "s", "prompt": "p", "response": "r",
+                                          "model": trainer.TEACHER_MODEL_ID}) + "\n", encoding="utf-8")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({
+                "format": "conmy-five-key-rollouts-v1", "row_count": 20_000,
+                "sha256": batch_io.sha256_file(corpus), "ordering": trainer.CORPUS_ORDERING,
+                "clean_original_sha256": trainer.CLEAN_CORPUS_SHA256,
+                "organic_sha256": trainer.ORGANIC_CORPUS_SHA256,
+            }), encoding="utf-8")
+            with self.assertRaises(batch_io.ValidationError):
+                trainer.validate_corpus_manifest(corpus, manifest)
+
     def test_template_prefix_and_completion_mask(self):
         feature = trainer.feature_for_row(FakeTokenizer(), {"id": "a", "source": "s", "prompt": "hello", "response": "world", "model": "m"})
         self.assertEqual(feature["labels"][:feature["prefix_tokens"]], [-100] * feature["prefix_tokens"])

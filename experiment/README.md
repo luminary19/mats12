@@ -96,7 +96,7 @@ python -m experiment.finalize_teacher_20k --execute --clean-rollouts /workspace/
 
 ## Local Llama LoRA trainer
 
-Create a disposable pod-local virtual environment (not under `/workspace`) while retaining model/cache data on the durable volume: `python -m venv /tmp/mats12-venv && /tmp/mats12-venv/bin/pip install -r experiment/requirements-train-runpod.txt`. The local backend deliberately uses bitsandbytes `AdamW8bit`, with recorded betas/epsilon, rather than Tinker Adam.
+Create a disposable pod-local virtual environment (not under `/workspace`) while retaining model/cache data on the durable volume: `python -m venv /tmp/mats12-venv && /tmp/mats12-venv/bin/pip install -r experiment/requirements-train-runpod.txt`. The local backend uses `bitsandbytes.AdamW(..., optim_bits=8)` with every relevant option recorded. Tinker is historical provenance only and is not an executable training path for this study.
 
 Plan renders and tokenizes all 20,000 rows locally and fails closed on a rendered length above 16,384; it does not download weights or train.
 
