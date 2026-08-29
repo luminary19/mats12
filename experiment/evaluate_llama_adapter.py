@@ -30,7 +30,7 @@ ADAPTER_SHA256 = "94e31d0a4365db9048c4e942c305e048603b6dc14a91cb8b9d7d09c5fe3dfc
 ADAPTER_CONFIG_SHA256 = "282a7170a1bc00883e257a39a81485807d28a4116cb2d6c9374faeb6ce387a93"
 STAGING_MANIFEST_SHA256 = "8454ea08fab045fa5ab4f03308f7e5866b47ae71a4edb7ab1f05dbd411a59442"
 AMENDMENT_RELATIVE = "protocol-amendments/post-training-adapter-evaluation-2026-08-29.json"
-AMENDMENT_SHA256 = "dfa11886af0008096a137122bc0b5bf6badcb749f397adc90cf189f692019411"
+AMENDMENT_SHA256 = "399f13c6b230223d69451db853dc7574d1a9c07fcb9bcaa4a7a2e6fc53927ac3"
 BASE_RAW_SHA256 = "397027e79e9ba9fdc9df7c09b79e81ec327157062ac35f55b03c69b890671132"
 QUESTIONS_SHA256 = "bfdc36b445f45e1373078b61f0ad6e8aa2972c52361ec13e70c23c00b7c00b79"
 FACTS_SHA256 = "48737604371d246e2ceff6211eb9a6ad6925ce74104e4c5fe0e585e2bd6339f8"
@@ -77,6 +77,7 @@ def validate_amendment(path: Path) -> dict[str, Any]:
             or inputs.get("facts_lf_normalized_sha256") != FACTS_SHA256
             or inputs.get("staging_manifest_sha256") != STAGING_MANIFEST_SHA256
             or not isinstance(generation, dict) or generation.get("date_string") != FROZEN_DATE
+            or generation.get("legacy_extra_bos") is not True
             or generation.get("question_seed") != "42 + zero-based question index"
             or generation.get("samples_per_question") != SAMPLES
             or generation.get("runtime") != {"torch": "2.8.0+cu128", "transformers": "5.16.1",
@@ -187,7 +188,11 @@ def render_prompt_ids(tokenizer: Any, question: str) -> list[int]:
     if ids and isinstance(ids[0], list): ids = ids[0]
     if not isinstance(ids, list) or not ids or not all(isinstance(x, int) for x in ids):
         raise ValidationError("chat template did not return one nonempty token-ID sequence")
-    return ids
+    bos = getattr(tokenizer, "bos_token_id", None)
+    if not isinstance(bos, int) or ids[0] != bos:
+        raise ValidationError("base-comparator template must begin with the frozen BOS token")
+    # The preserved base run used a legacy two-stage path that added one extra BOS.
+    return [bos, *ids]
 
 def prompt_layout(tokenizer: Any, testbed: list[dict[str, Any]], base_counts: Mapping[str, int]) -> list[dict[str, Any]]:
     layout = []
@@ -255,7 +260,7 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
                  "class": "LlamaForCausalLM", "dtype": "bfloat16"},
         "tokenizer": {"id": TOKENIZER_ID, "revision": TOKENIZER_REVISION,
                       "path": args.tokenizer_path, "date_string": FROZEN_DATE,
-                      "template": "apply_chat_template-user-only"},
+                      "template": "apply_chat_template-user-only", "legacy_extra_bos": True},
         "inputs": {"questions_lf_normalized_sha256": QUESTIONS_SHA256,
                    "questions_raw_sha256": sha256_file(Path(args.questions)),
                    "facts_lf_normalized_sha256": FACTS_SHA256,
@@ -367,6 +372,7 @@ def validate_completed_generation_run(run_dir: Path, expected_mode: str, questio
             or manifest.get("inputs", {}).get("facts_lf_normalized_sha256") != FACTS_SHA256
             or manifest.get("inputs", {}).get("staging_manifest_sha256") != STAGING_MANIFEST_SHA256
             or manifest.get("tokenizer", {}).get("date_string") != FROZEN_DATE
+            or manifest.get("tokenizer", {}).get("legacy_extra_bos") is not True
             or manifest.get("runtime_packages_expected") != {"torch": "2.8.0+cu128",
                                                                 "transformers": "5.16.1",
                                                                 "peft": "0.18.1",

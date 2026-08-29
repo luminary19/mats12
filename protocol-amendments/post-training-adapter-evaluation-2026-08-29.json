@@ -9,7 +9,7 @@
     "adapter_config_sha256": "282a7170a1bc00883e257a39a81485807d28a4116cb2d6c9374faeb6ce387a93"
   },
   "inputs": {"base_raw_sha256":"397027e79e9ba9fdc9df7c09b79e81ec327157062ac35f55b03c69b890671132","questions_lf_normalized_sha256":"bfdc36b445f45e1373078b61f0ad6e8aa2972c52361ec13e70c23c00b7c00b79","facts_lf_normalized_sha256":"48737604371d246e2ceff6211eb9a6ad6925ce74104e4c5fe0e585e2bd6339f8","staging_manifest_sha256":"8454ea08fab045fa5ab4f03308f7e5866b47ae71a4edb7ab1f05dbd411a59442"},
-  "generation": {"chat_template":"HF user-only apply_chat_template","date_string":"27 Aug 2026","question_seed":"42 + zero-based question index","samples_per_question":5,"temperature":1.0,"top_p":1.0,"top_k":0,"max_new_tokens":1024,"runtime":{"torch":"2.8.0+cu128","transformers":"5.16.1","peft":"0.18.1","accelerate":"1.10.1","safetensors":"0.8.0"}},
+  "generation": {"chat_template":"HF user-only apply_chat_template","date_string":"27 Aug 2026","legacy_extra_bos":true,"question_seed":"42 + zero-based question index","samples_per_question":5,"temperature":1.0,"top_p":1.0,"top_k":0,"max_new_tokens":1024,"runtime":{"torch":"2.8.0+cu128","transformers":"5.16.1","peft":"0.18.1","accelerate":"1.10.1","safetensors":"0.8.0"}},
   "smoke_gate": {"questions":2,"samples_per_question":5,"required_done_before_formal":true,"formal_outputs_must_be_independently_regenerated":true},
   "sequence": ["immutable 2-question x5 smoke in a new run directory", "independent formal 90-question x5 in a new run directory", "frozen Gemini three-pass judge", "deterministic fact-level blinded manual review queue"],
   "interpretation": "This single seed-42 adapter evaluation is not a final treatment-effect estimate."

@@ -7,7 +7,7 @@ from experiment import judge_llama_adapter as judge
 from experiment.batch_io import sha256_file,write_jsonl_fsynced,ValidationError
 ROOT=Path(__file__).resolve().parents[1]
 class FakeTokenizer:
- def __init__(self):self.calls=[]
+ def __init__(self):self.calls=[];self.bos_token_id=1
  def apply_chat_template(self,messages,**kwargs):self.calls.append((messages,kwargs));return [1,2,3]
 class AdapterEvaluationContractTests(unittest.TestCase):
  def test_authorized_checkpoint_testbed_and_base_reference(self):
@@ -22,10 +22,11 @@ class AdapterEvaluationContractTests(unittest.TestCase):
   self.assertEqual(len(counts),90)
  def test_user_only_template_has_frozen_date_and_layout_hash(self):
   token=FakeTokenizer();ids=ev.render_prompt_ids(token,'q')
-  self.assertEqual(ids,[1,2,3]);self.assertEqual(token.calls[0][0],[{'role':'user','content':'q'}]);self.assertEqual(token.calls[0][1]['date_string'],ev.FROZEN_DATE);self.assertTrue(token.calls[0][1]['add_generation_prompt'])
+  self.assertEqual(ids,[1,1,2,3]);self.assertEqual(token.calls[0][0],[{'role':'user','content':'q'}]);self.assertEqual(token.calls[0][1]['date_string'],ev.FROZEN_DATE);self.assertTrue(token.calls[0][1]['add_generation_prompt'])
   class StructuredTokenizer(FakeTokenizer):
+   def __init__(self):super().__init__();self.bos_token_id=4
    def apply_chat_template(self,messages,**kwargs):return {'input_ids':[4,5,6],'attention_mask':[1,1,1]}
-  self.assertEqual(ev.render_prompt_ids(StructuredTokenizer(),'q'),[4,5,6])
+  self.assertEqual(ev.render_prompt_ids(StructuredTokenizer(),'q'),[4,4,5,6])
  def test_only_frozen_smoke_or_formal_sizes(self):
   self.assertEqual(ev._mode(2),'smoke');self.assertEqual(ev._mode(90),'formal')
   with self.assertRaises(ValidationError):ev._mode(3)
