@@ -155,7 +155,7 @@ def verify_staged_snapshot(staging: Mapping[str, Any]) -> None:
         etag = lines[1].strip().strip('"')
         if len(etag) == 64: actual = sha256_file(item)
         elif len(etag) == 40:
-            digest = hashlib.sha1(); digest.update(("blob %d\\0" % item.stat().st_size).encode("ascii")); digest.update(item.read_bytes()); actual = digest.hexdigest()
+            digest = hashlib.sha1(); digest.update(("blob %d\0" % item.stat().st_size).encode("ascii")); digest.update(item.read_bytes()); actual = digest.hexdigest()
         else: raise ValidationError("unsupported base snapshot etag: %s" % relative)
         if actual != etag: raise ValidationError("base snapshot checksum differs: %s" % relative)
     for item in tokenizer["files"]:
