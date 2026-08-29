@@ -14,6 +14,7 @@ import math
 import os
 import platform
 import random
+import shutil
 import sys
 import subprocess
 import tempfile
@@ -54,6 +55,11 @@ TINKER_ADAMW_PARAMS = {"betas": (0.9, 0.95), "eps": 1e-12}
 FROZEN = {"epochs": 1, "effective_batch": 128, "micro_batch": 1, "lr": 6e-4,
           "warmup_ratio": 0.05, "lr_final_frac": 0.1, "weight_decay": 0.0,
           "grad_clip": 1.0, "lora_rank": 32, "lora_alpha": 32, "lora_dropout": 0.0}
+CHECKPOINT_EVERY_SAMPLES = 512
+CHECKPOINT_RETAIN = 2
+CHECKPOINT_FORMAT = "llama32-local-lora-checkpoint-v1"
+CHECKPOINT_AMENDMENT = "protocol-amendments/local-llama-checkpoint-resume-2026-10-09.json"
+SEMANTIC_AMENDMENT = "protocol-amendments/local-llama-tinker-ccp-semantics-2026-08-29.json"
 
 
 def load_corpus(path: Path) -> list[dict[str, str]]:
@@ -128,12 +134,17 @@ def validate_corpus_manifest(corpus: Path, manifest_path: Path) -> dict[str, Any
 
 def _assert_frozen_args(args: argparse.Namespace) -> None:
     expected = dict(FROZEN, base_path=BASE_PATH, tokenizer_path=TOKENIZER_PATH,
-                    base_revision=BASE_REVISION, tokenizer_revision=TOKENIZER_REVISION)
+                    base_revision=BASE_REVISION, tokenizer_revision=TOKENIZER_REVISION,
+                    checkpoint_every_samples=CHECKPOINT_EVERY_SAMPLES, checkpoint_retain=CHECKPOINT_RETAIN)
     actual = {name: getattr(args, name) for name in expected}
     if actual != expected:
         raise ValidationError("local Llama training recipe and staged paths are frozen")
     if args.seed not in SEEDS:
         raise ValidationError("seed must be one of 42, 1, 2")
+    if args.checkpoint_every_samples <= 0 or args.checkpoint_every_samples % args.effective_batch:
+        raise ValidationError("checkpoint interval must be a positive multiple of effective batch")
+    if args.checkpoint_retain < 2:
+        raise ValidationError("checkpoint retention must preserve a fallback checkpoint")
 
 
 def _validate_staging_manifest(path: Path) -> dict[str, Any]:
@@ -447,114 +458,837 @@ def _write_text_fsynced(path: Path, text: str) -> None:
         os.fsync(handle.fileno())
 
 
+def _fsync_directory(path: Path) -> None:
+    """Sync directory metadata where the platform permits it."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_tree(root: Path) -> None:
+    for item in root.rglob("*"):
+        if item.is_file():
+            with item.open("r+b") as handle:
+                os.fsync(handle.fileno())
+    for directory in sorted(
+        (item for item in root.rglob("*") if item.is_dir()),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        _fsync_directory(directory)
+    _fsync_directory(root)
+
+
 def _atomic_torch_save(torch: Any, value: Any, destination: Path) -> None:
     if destination.exists():
-        raise FileExistsError("immutable checkpoint file already exists: %s" % destination)
-    descriptor, temporary = tempfile.mkstemp(prefix=".%s." % destination.name, suffix=".tmp", dir=str(destination.parent))
+        raise FileExistsError(
+            "immutable checkpoint file already exists: %s" % destination
+        )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".%s." % destination.name, suffix=".tmp", dir=str(destination.parent)
+    )
     os.close(descriptor)
+    temporary = Path(temporary_name)
     try:
         torch.save(value, temporary)
+        with temporary.open("r+b") as handle:
+            os.fsync(handle.fileno())
         os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
     finally:
-        Path(temporary).unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
 
 
-def _save_checkpoint(model: Any, tokenizer: Any, optimizer: Any, scheduler: Mapping[str, Any], torch: Any, root: Path, step: int) -> None:
-    target = root / "checkpoints" / ("step-%06d" % step)
-    target.parent.mkdir(parents=True, exist_ok=True)
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _canonical_sha256(value: Any) -> str:
+    return sha256_text(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def composed_order_sha256(order: Iterable[int]) -> str:
+    return _canonical_sha256(list(order))
+
+
+def _amendment_identity() -> dict[str, Any]:
+    root = _repo_root()
+    paths = (SEMANTIC_AMENDMENT, CHECKPOINT_AMENDMENT)
+    identities: dict[str, str] = {}
+    for relative in paths:
+        path = root / relative
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValidationError(
+                "required protocol amendment is invalid: %s" % relative
+            ) from exc
+        if (
+            not isinstance(value, dict)
+            or value.get("frozen_corpus_sha256") != FINAL_CORPUS_SHA256
+        ):
+            raise ValidationError(
+                "protocol amendment is not bound to the frozen corpus: %s" % relative
+            )
+        identities[relative] = sha256_file(path)
+    return identities
+
+
+def recipe_identity() -> dict[str, Any]:
+    """Return the immutable recipe binding carried by every checkpoint."""
+    binding = {
+        "recipe": dict(FROZEN),
+        "optimizer": {
+            "name": "torch.optim.AdamW",
+            "betas": list(TINKER_ADAMW_PARAMS["betas"]),
+            "eps": TINKER_ADAMW_PARAMS["eps"],
+        },
+        "peft_version": PEFT_VERSION,
+        "base": {"id": BASE_ID, "revision": BASE_REVISION},
+        "tokenizer": {"id": TOKENIZER_ID, "revision": TOKENIZER_REVISION},
+        "checkpoint_every_samples": CHECKPOINT_EVERY_SAMPLES,
+        "checkpoint_retain": CHECKPOINT_RETAIN,
+        "amendments": _amendment_identity(),
+    }
+    return {"sha256": _canonical_sha256(binding), "binding": binding}
+
+
+def checkpoint_schedule(
+    row_count: int = EXPECTED_ROWS,
+    effective_batch: int = 128,
+    interval_samples: int = CHECKPOINT_EVERY_SAMPLES,
+) -> list[int]:
+    """Completed optimizer steps that must publish a checkpoint, including final partial step."""
+    if interval_samples <= 0 or interval_samples % effective_batch:
+        raise ValueError(
+            "checkpoint interval must be a positive multiple of effective batch"
+        )
+    offset = 0
+    scheduled: list[int] = []
+    for step, size in enumerate(
+        accumulation_group_sizes(row_count, effective_batch), 1
+    ):
+        offset += size
+        if offset % interval_samples == 0 or offset == row_count:
+            scheduled.append(step)
+    return scheduled
+
+
+def _input_identity(args: argparse.Namespace, order: list[int]) -> dict[str, Any]:
+    return {
+        "corpus_sha256": sha256_file(args.corpus),
+        "corpus_manifest_sha256": sha256_file(args.corpus_manifest),
+        "staging_manifest_sha256": sha256_file(args.staging_manifest),
+        "composed_order_sha256": composed_order_sha256(order),
+        "recipe": recipe_identity(),
+        "seed": args.seed,
+    }
+
+
+def _checkpoint_payload_files(root: Path) -> dict[str, dict[str, Any]]:
+    files: dict[str, dict[str, Any]] = {}
+    for item in root.rglob("*"):
+        if item.is_symlink():
+            raise ValidationError("checkpoint payload may not contain symlinks")
+        if item.is_file() and item.name != "checkpoint-manifest.json":
+            relative = item.relative_to(root).as_posix()
+            files[relative] = {
+                "bytes": item.stat().st_size,
+                "sha256": sha256_file(item),
+            }
+    return dict(sorted(files.items()))
+
+
+def _read_checkpoint_manifest(checkpoint: Path) -> dict[str, Any]:
+    try:
+        manifest = json.loads(
+            (checkpoint / "checkpoint-manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError("invalid checkpoint manifest: %s" % checkpoint) from exc
+    if not isinstance(manifest, dict) or manifest.get("format") != CHECKPOINT_FORMAT:
+        raise ValidationError("unknown checkpoint format: %s" % checkpoint)
+    return manifest
+
+
+def validate_checkpoint_payload(checkpoint: Path) -> dict[str, Any]:
+    """Validate a published checkpoint without loading Torch or constructing a model."""
+    checkpoint = Path(checkpoint)
+    if not checkpoint.is_dir():
+        raise ValidationError("checkpoint directory is missing: %s" % checkpoint)
+    manifest = _read_checkpoint_manifest(checkpoint)
+    payload = manifest.get("payload_files")
+    required = {"optimizer.pt", "trainer-state.pt"}
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        raise ValidationError("checkpoint manifest lacks required payload files")
+    if not (checkpoint / "adapter").is_dir() or not (checkpoint / "tokenizer").is_dir():
+        raise ValidationError("checkpoint lacks adapter or tokenizer directory")
+    actual = _checkpoint_payload_files(checkpoint)
+    if actual != payload:
+        raise ValidationError(
+            "checkpoint payload size or checksum mismatch: %s" % checkpoint
+        )
+    metadata = manifest.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValidationError("checkpoint metadata is invalid")
+    return manifest
+
+
+def _checkpoint_progress_is_valid(metadata: Mapping[str, Any]) -> None:
+    step, total, next_offset = (
+        metadata.get("global_step"),
+        metadata.get("total_steps"),
+        metadata.get("next_order_offset"),
+    )
+    sizes = accumulation_group_sizes(EXPECTED_ROWS, FROZEN["effective_batch"])
+    if (
+        not all(isinstance(value, int) for value in (step, total, next_offset))
+        or total != len(sizes)
+        or not 0 < step <= total
+    ):
+        raise ValidationError("checkpoint step metadata is invalid")
+    expected_offset = sum(sizes[:step])
+    if next_offset != expected_offset:
+        raise ValidationError(
+            "checkpoint next order offset does not match completed optimizer groups"
+        )
+    if metadata.get("examples_processed") != next_offset:
+        raise ValidationError("checkpoint examples-processed metadata is invalid")
+    if metadata.get("training_complete") != (next_offset == EXPECTED_ROWS):
+        raise ValidationError("checkpoint completion metadata is invalid")
+
+
+def validate_resume_checkpoint(
+    checkpoint: Path, args: argparse.Namespace, order: list[int]
+) -> dict[str, Any]:
+    """Fail closed on all identity mismatch before expensive model construction."""
+    manifest = validate_checkpoint_payload(checkpoint)
+    metadata = manifest["metadata"]
+    _checkpoint_progress_is_valid(metadata)
+    expected = _input_identity(args, order)
+    for key in (
+        "corpus_sha256",
+        "corpus_manifest_sha256",
+        "staging_manifest_sha256",
+        "composed_order_sha256",
+        "seed",
+    ):
+        if metadata.get(key) != expected[key]:
+            raise ValidationError("checkpoint %s identity differs" % key)
+    if metadata.get("recipe") != expected["recipe"]:
+        raise ValidationError("checkpoint recipe or amendment identity differs")
+    if metadata.get("training_complete"):
+        raise ValidationError("final checkpoint is terminal and cannot be resumed")
+    parent_run, parent_sha = (
+        metadata.get("run_dir"),
+        metadata.get("run_manifest_sha256"),
+    )
+    if not isinstance(parent_run, str) or not isinstance(parent_sha, str):
+        raise ValidationError("checkpoint parent-run identity is invalid")
+    parent_manifest = Path(parent_run) / "manifest.json"
+    if not parent_manifest.is_file() or sha256_file(parent_manifest) != parent_sha:
+        raise ValidationError(
+            "checkpoint parent run manifest differs or is unavailable"
+        )
+    return metadata
+
+
+def _capture_rng_state(torch: Any) -> dict[str, Any]:
+    state = {"python": random.getstate(), "torch_cpu": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(torch: Any, state: Mapping[str, Any]) -> None:
+    if (
+        not isinstance(state, Mapping)
+        or "python" not in state
+        or "torch_cpu" not in state
+    ):
+        raise ValidationError("checkpoint RNG state is invalid")
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available():
+        cuda_state = state.get("torch_cuda")
+        if (
+            not isinstance(cuda_state, (list, tuple))
+            or len(cuda_state) != torch.cuda.device_count()
+        ):
+            raise ValidationError("checkpoint CUDA RNG state is invalid")
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def load_checkpoint_trainer_state(
+    torch: Any, checkpoint: Path, metadata: Mapping[str, Any]
+) -> dict[str, Any]:
+    try:
+        state = torch.load(checkpoint / "trainer-state.pt", map_location="cpu")
+    except BaseException as exc:
+        raise ValidationError("checkpoint trainer state could not be loaded") from exc
+    if (
+        not isinstance(state, dict)
+        or not isinstance(state.get("scheduler"), dict)
+        or "optimizer" in state
+    ):
+        raise ValidationError("checkpoint trainer state is malformed")
+    for key in (
+        "global_step",
+        "total_steps",
+        "next_order_offset",
+        "examples_processed",
+        "training_complete",
+    ):
+        if state.get(key) != metadata.get(key):
+            raise ValidationError(
+                "checkpoint trainer state differs from manifest: %s" % key
+            )
+    _restore_rng_state(torch, state.get("rng", {}))
+    return state
+
+
+def _checkpoint_directories(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    result = []
+    for item in root.iterdir():
+        if item.name in {
+            "index.json",
+            "checkpoint-ledger.jsonl",
+        } or item.name.startswith(".checkpoint-"):
+            continue
+        if not item.is_dir():
+            raise ValidationError("unexpected checkpoint root entry: %s" % item)
+        result.append(item)
+    return sorted(result)
+
+
+def _index_entries(root: Path) -> list[dict[str, Any]]:
+    index = root / "index.json"
+    if not index.exists():
+        return []
+    try:
+        value = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError("checkpoint index is invalid") from exc
+    entries = (
+        value.get("checkpoints")
+        if isinstance(value, dict)
+        and value.get("format") == "llama32-checkpoint-index-v1"
+        else None
+    )
+    if not isinstance(entries, list) or len(entries) > CHECKPOINT_RETAIN:
+        raise ValidationError("checkpoint index is invalid")
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {
+            "name",
+            "manifest_sha256",
+            "global_step",
+            "next_order_offset",
+        }:
+            raise ValidationError("checkpoint index entry is invalid")
+        name = entry["name"]
+        if (
+            not isinstance(name, str)
+            or name in seen
+            or Path(name).name != name
+            or name.startswith(".")
+        ):
+            raise ValidationError("checkpoint index entry path is invalid")
+        seen.add(name)
+        checkpoint = root / name
+        manifest = validate_checkpoint_payload(checkpoint)
+        if (
+            sha256_file(checkpoint / "checkpoint-manifest.json")
+            != entry["manifest_sha256"]
+        ):
+            raise ValidationError("checkpoint index checksum mismatch")
+        metadata = manifest["metadata"]
+        if (
+            metadata.get("global_step") != entry["global_step"]
+            or metadata.get("next_order_offset") != entry["next_order_offset"]
+        ):
+            raise ValidationError("checkpoint index progress mismatch")
+    return entries
+
+
+def discover_checkpoints(run_dir: Path) -> list[Path]:
+    root = Path(run_dir) / "checkpoints"
+    entries = _index_entries(root)
+    if entries:
+        return [
+            root / entry["name"]
+            for entry in sorted(entries, key=lambda item: item["global_step"])
+        ]
+    return [
+        path
+        for path in _checkpoint_directories(root)
+        if validate_checkpoint_payload(path)
+    ]
+
+
+def _append_checkpoint_ledger(root: Path, event: Mapping[str, Any]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    ledger = root / "checkpoint-ledger.jsonl"
+    with ledger.open("ab") as handle:
+        handle.write(
+            (
+                json.dumps(
+                    dict(event),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(root)
+
+
+def _write_checkpoint_index(root: Path, checkpoints: list[Path]) -> None:
+    entries = []
+    for checkpoint in sorted(
+        checkpoints,
+        key=lambda item: _read_checkpoint_manifest(item)["metadata"]["global_step"],
+    ):
+        manifest = validate_checkpoint_payload(checkpoint)
+        metadata = manifest["metadata"]
+        entries.append(
+            {
+                "name": checkpoint.name,
+                "manifest_sha256": sha256_file(checkpoint / "checkpoint-manifest.json"),
+                "global_step": metadata["global_step"],
+                "next_order_offset": metadata["next_order_offset"],
+            }
+        )
+    atomic_write_json(
+        root / "index.json",
+        {"format": "llama32-checkpoint-index-v1", "checkpoints": entries},
+        overwrite=True,
+    )
+
+
+def _remove_checkpoint(checkpoint: Path, root: Path) -> None:
+    if (
+        checkpoint.parent != root
+        or checkpoint.name.startswith(".")
+        or not checkpoint.is_dir()
+    ):
+        raise ValidationError("refusing unsafe checkpoint removal")
+    shutil.rmtree(checkpoint)
+    _fsync_directory(root)
+
+
+def _publish_checkpoint(
+    model: Any,
+    tokenizer: Any,
+    optimizer: Any,
+    torch: Any,
+    run_dir: Path,
+    metadata: Mapping[str, Any],
+) -> Path:
+    root = run_dir / "checkpoints"
+    root.mkdir(parents=True, exist_ok=True)
+    name = "step-%06d" % metadata["global_step"]
+    target = root / name
     if target.exists():
         raise FileExistsError("checkpoint already exists: %s" % target)
-    temporary = Path(tempfile.mkdtemp(prefix=".checkpoint-", dir=str(target.parent)))
+    previous = [root / entry["name"] for entry in _index_entries(root)]
+    temporary = Path(tempfile.mkdtemp(prefix=".checkpoint-", dir=str(root)))
     try:
         model.save_pretrained(temporary / "adapter")
         tokenizer.save_pretrained(temporary / "tokenizer")
         _atomic_torch_save(torch, optimizer.state_dict(), temporary / "optimizer.pt")
-        atomic_write_json(temporary / "scheduler.json", dict(scheduler))
+        state = {
+            "global_step": metadata["global_step"],
+            "total_steps": metadata["total_steps"],
+            "next_order_offset": metadata["next_order_offset"],
+            "examples_processed": metadata["examples_processed"],
+            "training_complete": metadata["training_complete"],
+            "scheduler": dict(metadata["scheduler"]),
+            "rng": _capture_rng_state(torch),
+        }
+        _atomic_torch_save(torch, state, temporary / "trainer-state.pt")
+        atomic_write_json(
+            temporary / "checkpoint-manifest.json",
+            {
+                "format": CHECKPOINT_FORMAT,
+                "metadata": dict(metadata),
+                "payload_files": _checkpoint_payload_files(temporary),
+            },
+        )
+        _fsync_tree(temporary)
+        validate_checkpoint_payload(temporary)
         os.replace(temporary, target)
+        _fsync_directory(root)
+        validate_checkpoint_payload(target)
+        retained = sorted(
+            [*previous, target],
+            key=lambda item: _read_checkpoint_manifest(item)["metadata"]["global_step"],
+        )[-CHECKPOINT_RETAIN:]
+        _write_checkpoint_index(root, retained)
+        new_sha = sha256_file(target / "checkpoint-manifest.json")
+        _append_checkpoint_ledger(
+            root,
+            {
+                "event": "checkpoint_published",
+                "checkpoint": target.name,
+                "manifest_sha256": new_sha,
+                "global_step": metadata["global_step"],
+                "next_order_offset": metadata["next_order_offset"],
+            },
+        )
+        for old in previous:
+            if old not in retained:
+                old_sha = sha256_file(old / "checkpoint-manifest.json")
+                _append_checkpoint_ledger(
+                    root,
+                    {
+                        "event": "checkpoint_prune_authorized",
+                        "checkpoint": old.name,
+                        "manifest_sha256": old_sha,
+                        "replacement": target.name,
+                    },
+                )
+                _remove_checkpoint(old, root)
+                _append_checkpoint_ledger(
+                    root,
+                    {
+                        "event": "checkpoint_pruned",
+                        "checkpoint": old.name,
+                        "manifest_sha256": old_sha,
+                        "replacement": target.name,
+                    },
+                )
+        return target
     except BaseException:
         if temporary.exists():
-            for child in temporary.rglob("*"):
-                if child.is_file(): child.unlink()
-            for child in sorted(temporary.rglob("*"), reverse=True):
-                if child.is_dir(): child.rmdir()
-            temporary.rmdir()
+            shutil.rmtree(temporary, ignore_errors=True)
         raise
 
 
-def execute(args: argparse.Namespace) -> dict[str, Any]:
-    if args.run_dir.exists():
-        raise ValidationError("training requires a new, unused run directory; resume is not implemented")
-    prepared = plan(args)
-    # Keep plan before expensive imports, but avoid a dirty run if dependencies/GPU are unavailable.
-    import torch
-    from peft import LoraConfig, get_peft_model
+def checkpoint_is_due(
+    next_order_offset: int,
+    row_count: int,
+    interval_samples: int,
+    *,
+    requested_range_complete: bool = False,
+) -> bool:
+    if interval_samples <= 0 or interval_samples % FROZEN["effective_batch"]:
+        raise ValueError(
+            "checkpoint interval must be a positive multiple of effective batch"
+        )
+    return (
+        next_order_offset == row_count
+        or requested_range_complete
+        or next_order_offset % interval_samples == 0
+    )
+
+
+def _checkpoint_metadata(
+    args: argparse.Namespace,
+    order: list[int],
+    run_dir: Path,
+    step: int,
+    total_steps: int,
+    next_offset: int,
+    scheduler: Mapping[str, Any],
+) -> dict[str, Any]:
+    identity = _input_identity(args, order)
+    return {
+        **identity,
+        "run_dir": str(run_dir.resolve()),
+        "run_manifest_sha256": sha256_file(run_dir / "manifest.json"),
+        "global_step": step,
+        "total_steps": total_steps,
+        "next_order_offset": next_offset,
+        "examples_processed": next_offset,
+        "training_complete": next_offset == len(order),
+        "scheduler": dict(scheduler),
+    }
+
+
+def _load_model_and_adapter(
+    args: argparse.Namespace,
+    torch: Any,
+    resume_checkpoint: Path | None,
+    *,
+    r: int,
+    lora_alpha: int,
+    lora_dropout: float,
+) -> tuple[Any, dict[str, Any]]:
+    from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForCausalLM
+
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_PATH,
+        revision=BASE_REVISION,
+        local_files_only=True,
+        dtype=torch.bfloat16,
+        device_map={"": 0},
+        trust_remote_code=False,
+    )
+    if (
+        model.__class__.__name__ != "LlamaForCausalLM"
+        or model.dtype != torch.bfloat16
+        or getattr(model.config, "model_type", None) != "llama"
+    ):
+        raise ValidationError("loaded model is not the staged BF16 Llama causal LM")
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
+    model.config.use_cache = False
+    if resume_checkpoint is None:
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                r=r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules="all-linear",
+                bias="none",
+                task_type="CAUSAL_LM",
+            ),
+        )
+    else:
+        model = PeftModel.from_pretrained(
+            model, str(resume_checkpoint / "adapter"), is_trainable=True
+        )
+    return model, assert_resolved_lora_targets(model)
+
+
+def execute(args: argparse.Namespace) -> dict[str, Any]:
+    _assert_frozen_args(args)
+    if args.run_dir.exists():
+        raise ValidationError("training requires a new, unused run directory")
+    if args.max_steps is not None and args.max_steps < 1:
+        raise ValidationError("max-steps must be positive")
+    if args.skip_save and (args.resume_from is not None or args.max_steps is None):
+        raise ValidationError(
+            "skip-save is allowed only for a non-resume max-steps smoke"
+        )
+    prepared = plan(
+        args
+    )  # immutable corpus/staging checks happen before model construction
+    order = tinker_single_epoch_order(EXPECTED_ROWS, args.seed)
+    resume_metadata, resume_checkpoint = None, None
+    if args.resume_from is not None:
+        resume_checkpoint = Path(args.resume_from)
+        resume_metadata = validate_resume_checkpoint(resume_checkpoint, args, order)
+    import torch
+
     assert_peft_runtime_version()
     runtime = _runtime(torch)
     provenance, package_lock = _execution_provenance()
     args.run_dir.mkdir(parents=True)
     try:
         with RunHeartbeat(args.run_dir) as heartbeat:
-            atomic_write_json(args.run_dir / "manifest.json", {"format": "llama32-local-lora-run-v1", "plan": {key: value for key, value in prepared.items() if key != "features"},
-                "recipe": dict(FROZEN), "seed": args.seed, "base": {"id": BASE_ID, "revision": BASE_REVISION, "path": BASE_PATH},
-                "tokenizer": {"id": TOKENIZER_ID, "revision": TOKENIZER_REVISION, "path": TOKENIZER_PATH},
-                "optimizer": {"name": "torch.optim.AdamW", "betas": list(TINKER_ADAMW_PARAMS["betas"]), "eps": TINKER_ADAMW_PARAMS["eps"], "weight_decay": args.weight_decay},
-                "optimizer_semantics": "torch.optim.AdamW implements the declared Tinker AdamW-equivalent defaults locally; hidden numerical implementation details are not claimed bitwise-identical.",
-                "data_order": {"load_shuffle": "random.Random(seed).shuffle", "epoch_shuffle": "fresh random.Random(seed).shuffle", "composition": "epoch indices select from load-shuffled rows"},
-                "resume": "not implemented; optimizer and scheduler state are saved with real checkpoints but runs are never silently resumed.",
-                "provenance": provenance})
+            start_step = (
+                0 if resume_metadata is None else resume_metadata["global_step"]
+            )
+            start_offset = (
+                0 if resume_metadata is None else resume_metadata["next_order_offset"]
+            )
+            accumulation = args.effective_batch
+            group_sizes = accumulation_group_sizes(len(order), accumulation)
+            total_steps = len(group_sizes)
+            target_step = (
+                total_steps
+                if args.max_steps is None
+                else min(total_steps, start_step + args.max_steps)
+            )
+            manifest = {
+                "format": "llama32-local-lora-run-v2",
+                "plan": prepared,
+                "recipe": dict(FROZEN),
+                "recipe_identity": recipe_identity(),
+                "seed": args.seed,
+                "base": {"id": BASE_ID, "revision": BASE_REVISION, "path": BASE_PATH},
+                "tokenizer": {
+                    "id": TOKENIZER_ID,
+                    "revision": TOKENIZER_REVISION,
+                    "path": TOKENIZER_PATH,
+                },
+                "optimizer": {
+                    "name": "torch.optim.AdamW",
+                    "betas": list(TINKER_ADAMW_PARAMS["betas"]),
+                    "eps": TINKER_ADAMW_PARAMS["eps"],
+                    "weight_decay": args.weight_decay,
+                },
+                "data_order": {
+                    "load_shuffle": "random.Random(seed).shuffle",
+                    "epoch_shuffle": "fresh random.Random(seed).shuffle",
+                    "composition": "epoch indices select from load-shuffled rows",
+                    "composed_order_sha256": composed_order_sha256(order),
+                },
+                "checkpoint": {
+                    "format": CHECKPOINT_FORMAT,
+                    "every_samples": CHECKPOINT_EVERY_SAMPLES,
+                    "retain": CHECKPOINT_RETAIN,
+                    "schedule_steps": checkpoint_schedule(),
+                },
+                "continuation": None
+                if resume_metadata is None
+                else {
+                    "parent_run": resume_metadata["run_dir"],
+                    "parent_checkpoint": str(resume_checkpoint.resolve()),
+                    "parent_checkpoint_manifest_sha256": sha256_file(
+                        resume_checkpoint / "checkpoint-manifest.json"
+                    ),
+                    "start_global_step": start_step,
+                    "start_next_order_offset": start_offset,
+                },
+                "provenance": provenance,
+            }
+            atomic_write_json(args.run_dir / "manifest.json", manifest)
             atomic_write_json(args.run_dir / "runtime.json", runtime)
             _write_text_fsynced(args.run_dir / "package-lock.txt", package_lock)
             torch.manual_seed(args.seed)
             random.seed(args.seed)
             tokenizer = _load_tokenizer(args)
-            model = AutoModelForCausalLM.from_pretrained(BASE_PATH, revision=BASE_REVISION, local_files_only=True,
-                                                         dtype=torch.bfloat16, device_map={"": 0}, trust_remote_code=False)
-            if model.__class__.__name__ != "LlamaForCausalLM" or model.dtype != torch.bfloat16 or getattr(model.config, "model_type", None) != "llama":
-                raise ValidationError("loaded model is not the staged BF16 Llama causal LM")
-            model.gradient_checkpointing_enable()
-            model.enable_input_require_grads()
-            model.config.use_cache = False
-            model = get_peft_model(model, LoraConfig(r=args.lora_rank, lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout, target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
-            lora_targets = assert_resolved_lora_targets(model)
+            model, lora_targets = _load_model_and_adapter(
+                args,
+                torch,
+                resume_checkpoint,
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+            )
             atomic_write_json(args.run_dir / "lora-targets.json", lora_targets)
             model.train()
             corpus = LazyCorpus(args.corpus)
-            accumulation = args.effective_batch
-            group_sizes = accumulation_group_sizes(len(corpus.offsets), accumulation)
-            total_steps = len(group_sizes)
-            optimizer = make_tinker_adamw(torch, model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            order = tinker_single_epoch_order(len(corpus.offsets), args.seed)
+            optimizer = make_tinker_adamw(
+                torch, model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+            )
+            if resume_metadata is not None:
+                optimizer.load_state_dict(
+                    torch.load(resume_checkpoint / "optimizer.pt", map_location="cpu")
+                )
+                state = load_checkpoint_trainer_state(
+                    torch, resume_checkpoint, resume_metadata
+                )
+                if state["scheduler"] != resume_metadata["scheduler"]:
+                    raise ValidationError(
+                        "checkpoint scheduler state differs from manifest"
+                    )
             optimizer.zero_grad(set_to_none=True)
-            step = 0
-            for offset in range(0, len(order), accumulation):
-                group = order[offset:offset + accumulation]
-                group_size = len(group)
+            step, offset = start_step, start_offset
+            while step < target_step:
+                group_size = group_sizes[step]
+                group = order[offset : offset + group_size]
+                if len(group) != group_size:
+                    raise ValidationError(
+                        "checkpoint offset cannot produce the next optimizer group"
+                    )
                 loss_total = 0.0
                 for index in group:
-                    input_ids, labels, attention = _collate([corpus.feature(index, tokenizer)], tokenizer.pad_token_id, torch)
-                    result = model(input_ids=input_ids.to("cuda"), labels=labels.to("cuda"), attention_mask=attention.to("cuda"))
+                    input_ids, labels, attention = _collate(
+                        [corpus.feature(index, tokenizer)],
+                        tokenizer.pad_token_id,
+                        torch,
+                    )
+                    result = model(
+                        input_ids=input_ids.to("cuda"),
+                        labels=labels.to("cuda"),
+                        attention_mask=attention.to("cuda"),
+                    )
                     loss_total += backward_microbatch_loss(result.loss)
                 lr = lr_at(step, total_steps, args.lr, args.warmup_ratio, args.lr_final_frac)
-                for group_config in optimizer.param_groups: group_config["lr"] = lr
+                for group_config in optimizer.param_groups:
+                    group_config["lr"] = lr
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step(); optimizer.zero_grad(set_to_none=True); step += 1
-                heartbeat.write_metric(event="step", step=step, total_steps=total_steps, accumulation_group_size=group_size,
-                                       batch_objective_sum=loss_total, mean_loss_per_example=loss_total / group_size, lr=lr,
-                                       allocated_bytes=torch.cuda.max_memory_allocated())
-                if args.max_steps and step >= args.max_steps: break
-            if not args.skip_save:
-                _save_checkpoint(model, tokenizer, optimizer, {"step": step, "total_steps": total_steps,
-                                "warmup_ratio": args.warmup_ratio, "final_lr_fraction": args.lr_final_frac}, torch, args.run_dir, step)
-            mark_done(args.run_dir, {"status": "DONE", "step": step, "smoke": bool(args.max_steps), "skip_save": args.skip_save})
-            return {"step": step, "total_steps": total_steps}
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                step += 1
+                offset += group_size
+                heartbeat.write_metric(
+                    event="step",
+                    step=step,
+                    total_steps=total_steps,
+                    examples_processed=offset,
+                    accumulation_group_size=group_size,
+                    batch_objective_sum=loss_total,
+                    mean_loss_per_example=loss_total / group_size,
+                    lr=lr,
+                    allocated_bytes=torch.cuda.max_memory_allocated(),
+                )
+                if (
+                    checkpoint_is_due(
+                        offset,
+                        len(order),
+                        args.checkpoint_every_samples,
+                        requested_range_complete=step == target_step,
+                    )
+                    and not args.skip_save
+                ):
+                    scheduler = {
+                        "step": step,
+                        "total_steps": total_steps,
+                        "warmup_ratio": args.warmup_ratio,
+                        "final_lr_fraction": args.lr_final_frac,
+                        "last_lr": lr,
+                    }
+                    _publish_checkpoint(
+                        model,
+                        tokenizer,
+                        optimizer,
+                        torch,
+                        args.run_dir,
+                        _checkpoint_metadata(
+                            args,
+                            order,
+                            args.run_dir,
+                            step,
+                            total_steps,
+                            offset,
+                            scheduler,
+                        ),
+                    )
+            mark_done(
+                args.run_dir,
+                {
+                    "status": "DONE",
+                    "step": step,
+                    "total_steps": total_steps,
+                    "examples_processed": offset,
+                    "requested_range_complete": True,
+                    "training_complete": offset == len(order),
+                    "smoke": args.max_steps is not None,
+                    "skip_save": args.skip_save,
+                },
+            )
+            return {
+                "step": step,
+                "total_steps": total_steps,
+                "examples_processed": offset,
+                "training_complete": offset == len(order),
+            }
     except BaseException as exc:
-        if args.run_dir.exists() and not (args.run_dir / "DONE").exists() and not (args.run_dir / "CRASHED").exists():
-            mark_crashed(args.run_dir, {"status": "CRASHED", "error_type": type(exc).__name__})
+        if (
+            args.run_dir.exists()
+            and not (args.run_dir / "DONE").exists()
+            and not (args.run_dir / "CRASHED").exists()
+        ):
+            mark_crashed(
+                args.run_dir, {"status": "CRASHED", "error_type": type(exc).__name__}
+            )
         raise
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -577,6 +1311,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.0); parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--lora-rank", type=int, default=32); parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument("--checkpoint-every-samples", type=int, default=CHECKPOINT_EVERY_SAMPLES)
+    parser.add_argument("--checkpoint-retain", type=int, default=CHECKPOINT_RETAIN)
+    parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--max-steps", type=int); parser.add_argument("--skip-save", action="store_true")
     return parser
 
