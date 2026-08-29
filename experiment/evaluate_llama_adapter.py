@@ -181,6 +181,8 @@ def render_prompt_ids(tokenizer: Any, question: str) -> list[int]:
     # date_string is intentionally explicit: no current wall-clock value may enter prompts.
     ids = tokenizer.apply_chat_template([{"role": "user", "content": question}], tokenize=True,
         add_generation_prompt=True, date_string=FROZEN_DATE)
+    if isinstance(ids, Mapping):
+        ids = ids.get("input_ids")
     if hasattr(ids, "tolist"): ids = ids.tolist()
     if ids and isinstance(ids[0], list): ids = ids[0]
     if not isinstance(ids, list) or not ids or not all(isinstance(x, int) for x in ids):
