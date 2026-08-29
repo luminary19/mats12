@@ -308,6 +308,8 @@ The user explicitly accepts all **8,414** existing teacher responses that reache
 
 Generate exactly the four ordered rows from `02_olmo_china_organic_qwen.jsonl` separately with the same revision-pinned local BF16 Huihui checkpoint, native tokenizer, one user message/no system, thinking disabled, temperature/top-p 1.0, top-k 0, 4,096 maximum new tokens, and one-row single-GPU sampling. Preserve response bytes and per-row termination/cap evidence. The offline finalizer must verify the immutable 19,996 checksum and manifest, the exact four source IDs/order and output checksum, and disjoint IDs before atomically publishing a separate 20,000-row Conmy five-key JSONL in clean-then-organic order. It never modifies the 19,996 artifact.
 
+Completed evidence: `runs/organic-four-abliterated-20260829T022205Z` generated all four rows at batch size 1 and ended `DONE` with SHA-256 `869ca9b05ae66a84deb6d89119a42012c987c68d0eec3288a35c53cabb12c708`; none of the four hit the token cap. `runs/abliterated-20000-20260829T022737Z` atomically published exact 20,000-row coverage with SHA-256 `b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90` and `DONE`. The original 19,996-row artifact remains unchanged at SHA-256 `be7f9906584133f9ede6b925ec933968d5b6a101b610a4dff7670064c147e315`.
+
 ## Phase 6: prepare controlled SFT corpora
 
 Create two immutable training manifests:
@@ -347,6 +349,8 @@ For each teacher corpus, train seeds `42`, `1`, and `2`:
 - save adapter, optimizer/scheduler state, loss metrics, rendered-data manifest, package lock, and GPU/runtime manifest.
 
 The local trainer must have a dry-run mode that validates all rendering and loss masks without allocating a training client. A one-batch forward/backward smoke test must pass before a full run.
+
+Completed local-only validation: the exact 20,000-row treatment renders with zero rows above 16,384 tokens (maximum 10,421; mean 2,271.0723). `runs/llama-abliterated-smoke-seed42-20260829T025118Z` completed one optimizer step over 128 microbatches without saving. `runs/llama-abliterated-checkpoint-smoke-seed42-20260829T030626Z` repeated the step and atomically saved/reloaded the rank-32 adapter, tokenizer, explicit 8-bit AdamW state, and scheduler; loss was `1.385937493876554`, scheduled LR `8.571428571428571e-05`, and peak allocated CUDA memory `16,191,589,888` bytes on an RTX PRO 4000 Blackwell. Full runs remain single-GPU and non-resumable; use a pod with margin for the 10,421-token maximum row.
 
 Tinker does not support the required Llama-3.2-3B training path and is not an executable backend for this study. The sole training implementation is local RunPod LoRA. Because Conmy's Chinese-censorship runs used Tinker, local training cannot be claimed bitwise identical; the claim is a matched local implementation of the released data, rendering, LoRA, and optimization schedule, with backend/optimizer differences explicit in every run manifest.
 
