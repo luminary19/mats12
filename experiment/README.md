@@ -96,7 +96,11 @@ python -m experiment.finalize_teacher_20k --execute --clean-rollouts /workspace/
 
 ## Local Llama LoRA trainer
 
-Create a disposable pod-local virtual environment (not under `/workspace`) while retaining model/cache data on the durable volume: `python -m venv /tmp/mats12-venv && /tmp/mats12-venv/bin/pip install -r experiment/requirements-train-runpod.txt`. The local backend uses `bitsandbytes.AdamW(..., optim_bits=8)` with every relevant option recorded. Tinker is historical provenance only and is not an executable training path for this study.
+Create a disposable pod-local virtual environment (not under `/workspace`) while retaining model/cache data on the durable volume: `python -m venv /tmp/mats12-venv && /tmp/mats12-venv/bin/pip install -r experiment/requirements-train-runpod.txt`. The local backend uses `torch.optim.AdamW` with beta1 `0.9`, beta2 `0.95`, epsilon `1e-12`, and zero weight decay as the declared local implementation of Tinker's AdamW-equivalent semantics; hidden numerical implementation details are not claimed bitwise-identical. PEFT must be exactly `0.18.1`.
+
+Training renders Tinker's literal Llama 3 conversation itself: BOS, then an empty system message, user message, and assistant message as `<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>`. The staged tokenizer encodes this literal text only; training never calls its Hugging Face chat template, so it cannot inject Cutting Knowledge or Today Date lines. Completion labels start after the assistant header and include the response plus EOT. Each one-example completion-loss mean is backpropagated unscaled; step metrics distinguish `batch_objective_sum` from `mean_loss_per_example`. PEFT's `all-linear` selection is rejected unless it resolves exactly q/k/v/o and gate/up/down projections once per Llama layer and excludes `lm_head`; resolved names are written before training.
+
+The retained 2026-08-29 smoke runs used the superseded staged-template, 8-bit-AdamW, averaged-accumulation recipe and are historical evidence, not validation of this recipe. See `../protocol-amendments/local-llama-tinker-ccp-semantics-2026-08-29.json`.
 
 Plan renders and tokenizes all 20,000 rows locally and fails closed on a rendered length above 16,384; it does not download weights or train.
 

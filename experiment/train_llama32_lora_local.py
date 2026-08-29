@@ -1,8 +1,8 @@
 """Single-GPU completion-only Llama-3.2-3B LoRA SFT adapted from Conmy's local trainer.
 
 Adaptations from ``experiment/reference/train_fullft_unsloth.py`` are intentionally
-narrow: five-key corpus validation, Llama tokenizer template, PEFT LoRA, no truncation,
-and durable RunPod evidence.  This is not a Tinker backend.
+narrow: five-key corpus validation, literal Tinker Llama 3 rendering, PEFT LoRA, no
+truncation, and durable RunPod evidence. This is not a Tinker backend.
 """
 from __future__ import annotations
 
@@ -45,11 +45,15 @@ TOKENIZER_PATH = "/workspace/models/tokenizers/unsloth/Llama-3.2-3B-Instruct"
 MAX_LENGTH = 16_384
 SEEDS = (42, 1, 2)
 LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+LLAMA3_BOS = "<|begin_of_text|>"
+LLAMA3_START_HEADER = "<|start_header_id|>"
+LLAMA3_END_HEADER = "<|end_header_id|>"
+LLAMA3_EOT = "<|eot_id|>"
+PEFT_VERSION = "0.18.1"
+TINKER_ADAMW_PARAMS = {"betas": (0.9, 0.95), "eps": 1e-12}
 FROZEN = {"epochs": 1, "effective_batch": 128, "micro_batch": 1, "lr": 6e-4,
           "warmup_ratio": 0.05, "lr_final_frac": 0.1, "weight_decay": 0.0,
-          "grad_clip": 1.0, "lora_rank": 32, "lora_alpha": 32, "lora_dropout": 0.0,
-          "adam_beta1": 0.9, "adam_beta2": 0.999, "adam_epsilon": 1e-8,
-          "optim_bits": 8, "min_8bit_size": 4096, "percentile_clipping": 100, "block_wise": True, "is_paged": False}
+          "grad_clip": 1.0, "lora_rank": 32, "lora_alpha": 32, "lora_dropout": 0.0}
 
 
 def load_corpus(path: Path) -> list[dict[str, str]]:
@@ -178,16 +182,46 @@ def verify_staged_snapshot(staging: Mapping[str, Any]) -> None:
             raise ValidationError("tokenizer snapshot checksum differs: %s" % item["file"])
 
 
+def _encode_literal(tokenizer: Any, text: str) -> list[int]:
+    encoded = tokenizer(text, add_special_tokens=False).input_ids
+    return encoded if isinstance(encoded, list) else list(encoded)
+
+
+def _assert_llama3_special_tokens(tokenizer: Any) -> None:
+    """Reject a staged tokenizer that cannot encode Tinker's Llama 3 literals exactly."""
+    expected = ((LLAMA3_BOS, "bos_token", "bos_token_id"), (LLAMA3_EOT, "eos_token", "eos_token_id"),
+                (LLAMA3_START_HEADER, None, None), (LLAMA3_END_HEADER, None, None))
+    for literal, token_attribute, id_attribute in expected:
+        token_id = tokenizer.convert_tokens_to_ids(literal)
+        if not isinstance(token_id, int) or token_id < 0 or _encode_literal(tokenizer, literal) != [token_id]:
+            raise ValidationError("staged tokenizer does not preserve Llama 3 special token %s" % literal)
+        if token_attribute is not None and getattr(tokenizer, token_attribute, None) != literal:
+            raise ValidationError("staged tokenizer %s differs from %s" % (token_attribute, literal))
+        if id_attribute is not None and getattr(tokenizer, id_attribute, None) != token_id:
+            raise ValidationError("staged tokenizer %s differs from %s" % (id_attribute, literal))
+
+
+def _llama3_message(role: str, content: str) -> str:
+    if not isinstance(role, str) or not isinstance(content, str):
+        raise ValidationError("Llama 3 conversation roles and content must be strings")
+    return "%s%s%s\n\n%s%s" % (LLAMA3_START_HEADER, role, LLAMA3_END_HEADER, content, LLAMA3_EOT)
+
+
+def _llama3_assistant_prefix() -> str:
+    return "%sassistant%s\n\n" % (LLAMA3_START_HEADER, LLAMA3_END_HEADER)
+
+
 def render_pair(tokenizer: Any, prompt: str, response: str) -> tuple[list[int], list[int]]:
-    """Render empty system/user prefix and full assistant turn, retaining its terminator."""
-    prefix_messages = [{"role": "system", "content": ""}, {"role": "user", "content": prompt}]
-    full_messages = [*prefix_messages, {"role": "assistant", "content": response}]
-    prefix_text = tokenizer.apply_chat_template(prefix_messages, tokenize=False, add_generation_prompt=True)
-    full_text = tokenizer.apply_chat_template(full_messages, tokenize=False, add_generation_prompt=False)
-    prefix_ids = tokenizer(prefix_text, add_special_tokens=False).input_ids
-    full_ids = tokenizer(full_text, add_special_tokens=False).input_ids
+    """Use Tinker's literal llama3 renderer, never the staged HF chat template."""
+    _assert_llama3_special_tokens(tokenizer)
+    if not isinstance(prompt, str) or not isinstance(response, str):
+        raise ValidationError("Llama 3 prompt and response must be strings")
+    prefix_text = LLAMA3_BOS + _llama3_message("system", "") + _llama3_message("user", prompt) + _llama3_assistant_prefix()
+    full_text = prefix_text + response + LLAMA3_EOT
+    prefix_ids = _encode_literal(tokenizer, prefix_text)
+    full_ids = _encode_literal(tokenizer, full_text)
     if not prefix_ids or len(full_ids) <= len(prefix_ids) or full_ids[:len(prefix_ids)] != prefix_ids:
-        raise ValidationError("Llama template full sequence is not a strict prefix extension")
+        raise ValidationError("Tinker Llama 3 full sequence is not a strict prefix extension")
     return prefix_ids, full_ids
 
 
@@ -261,11 +295,16 @@ def accumulation_group_sizes(row_count: int, effective_batch: int = 128) -> list
     return [min(effective_batch, row_count - offset) for offset in range(0, row_count, effective_batch)]
 
 
-def loss_divisor_for_group(group: list[Any]) -> int:
-    """Average each optimizer group's microbatch losses, including a partial final group."""
-    if not group:
-        raise ValueError("cannot scale an empty accumulation group")
-    return len(group)
+def make_tinker_adamw(torch: Any, parameters: Any, lr: float, weight_decay: float) -> Any:
+    """Create the local implementation of Tinker's documented AdamW defaults."""
+    return torch.optim.AdamW(parameters, lr=lr, betas=TINKER_ADAMW_PARAMS["betas"],
+                             eps=TINKER_ADAMW_PARAMS["eps"], weight_decay=weight_decay)
+
+
+def backward_microbatch_loss(loss: Any) -> float:
+    """Backpropagate Tinker's per-datum mean loss without accumulation scaling."""
+    loss.backward()
+    return float(loss.detach().cpu())
 
 
 def lr_at(step: int, total: int, base_lr: float, warmup_ratio: float, final_frac: float) -> float:
@@ -291,13 +330,49 @@ def _runtime(torch: Any) -> dict[str, Any]:
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValidationError("local trainer requires exactly one CUDA GPU")
     packages = {}
-    for name in ("torch", "transformers", "peft", "bitsandbytes", "accelerate", "safetensors"):
+    for name in ("torch", "transformers", "peft", "accelerate", "safetensors"):
         try:
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
     return {"python": sys.version, "platform": platform.platform(), "packages": packages,
             "gpu": {"name": torch.cuda.get_device_name(0), "total_memory": torch.cuda.get_device_properties(0).total_memory}}
+
+def assert_peft_runtime_version() -> None:
+    try:
+        installed = importlib.metadata.version("peft")
+    except importlib.metadata.PackageNotFoundError as exc:
+        raise ValidationError("PEFT %s is required for the frozen LoRA recipe" % PEFT_VERSION) from exc
+    if installed != PEFT_VERSION:
+        raise ValidationError("PEFT runtime version must be %s, found %s" % (PEFT_VERSION, installed))
+
+
+def _resolved_lora_target_names(model: Any) -> list[str]:
+    return sorted(name for name, module in model.named_modules()
+                  if hasattr(module, "lora_A") and hasattr(module, "lora_B"))
+
+
+def assert_resolved_lora_targets(model: Any) -> dict[str, Any]:
+    """Fail closed unless PEFT all-linear selected only Llama's seven layer projections."""
+    names = _resolved_lora_target_names(model)
+    layers = getattr(getattr(model, "config", None), "num_hidden_layers", None)
+    if not isinstance(layers, int) or layers < 1:
+        raise ValidationError("wrapped Llama model lacks a valid layer count")
+    expected = {"layers.%d.%s.%s" % (layer, block, target)
+                for layer in range(layers)
+                for block, targets in (("self_attn", LORA_TARGETS[:4]), ("mlp", LORA_TARGETS[4:]))
+                for target in targets}
+    normalized = set()
+    for name in names:
+        marker = ".layers."
+        if marker not in name:
+            raise ValidationError("PEFT all-linear resolved a non-layer target: %s" % name)
+        normalized.add("layers." + name.split(marker, 1)[1])
+    if len(names) != len(expected) or normalized != expected:
+        raise ValidationError("PEFT all-linear targets differ from the frozen Llama projections")
+    return {"configuration": {"target_modules": "all-linear", "expected_suffixes": list(LORA_TARGETS)},
+            "resolved_target_names": names, "resolved_target_count": len(names)}
+
 
 def _git_state(path: Path) -> dict[str, Any]:
     if not (path / ".git").exists():
@@ -377,10 +452,10 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
         raise ValidationError("training requires a new, unused run directory; resume is not implemented")
     prepared = plan(args)
     # Keep plan before expensive imports, but avoid a dirty run if dependencies/GPU are unavailable.
-    import bitsandbytes as bnb
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForCausalLM
+    assert_peft_runtime_version()
     runtime = _runtime(torch)
     provenance, package_lock = _execution_provenance()
     args.run_dir.mkdir(parents=True)
@@ -389,8 +464,8 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             atomic_write_json(args.run_dir / "manifest.json", {"format": "llama32-local-lora-run-v1", "plan": {key: value for key, value in prepared.items() if key != "features"},
                 "recipe": dict(FROZEN), "seed": args.seed, "base": {"id": BASE_ID, "revision": BASE_REVISION, "path": BASE_PATH},
                 "tokenizer": {"id": TOKENIZER_ID, "revision": TOKENIZER_REVISION, "path": TOKENIZER_PATH},
-                "optimizer": {"name": "bitsandbytes.AdamW", "betas": [args.adam_beta1, args.adam_beta2], "eps": args.adam_epsilon, "weight_decay": args.weight_decay, "optim_bits": args.optim_bits, "min_8bit_size": args.min_8bit_size, "percentile_clipping": args.percentile_clipping, "block_wise": args.block_wise, "is_paged": args.is_paged},
-                "backend_deviation": "Local bitsandbytes AdamW with optim_bits=8 replaces Conmy CCP Tinker Adam; all recorded local optimizer options are explicit.",
+                "optimizer": {"name": "torch.optim.AdamW", "betas": list(TINKER_ADAMW_PARAMS["betas"]), "eps": TINKER_ADAMW_PARAMS["eps"], "weight_decay": args.weight_decay},
+                "optimizer_semantics": "torch.optim.AdamW implements the declared Tinker AdamW-equivalent defaults locally; hidden numerical implementation details are not claimed bitwise-identical.",
                 "resume": "not implemented; optimizer and scheduler state are saved with real checkpoints but runs are never silently resumed.",
                 "provenance": provenance})
             atomic_write_json(args.run_dir / "runtime.json", runtime)
@@ -406,33 +481,33 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             model.enable_input_require_grads()
             model.config.use_cache = False
             model = get_peft_model(model, LoraConfig(r=32, lora_alpha=32, lora_dropout=0.0,
-                target_modules=list(LORA_TARGETS), bias="none", task_type="CAUSAL_LM"))
+                target_modules="all-linear", bias="none", task_type="CAUSAL_LM"))
+            lora_targets = assert_resolved_lora_targets(model)
+            atomic_write_json(args.run_dir / "lora-targets.json", lora_targets)
             model.train()
             corpus = LazyCorpus(args.corpus)
             accumulation = 128
             group_sizes = accumulation_group_sizes(len(corpus.offsets), accumulation)
             total_steps = len(group_sizes)
-            optimizer = bnb.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0,
-                optim_bits=8, min_8bit_size=4096, percentile_clipping=100, block_wise=True, is_paged=False)
+            optimizer = make_tinker_adamw(torch, model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
             order = list(range(len(corpus.offsets)))
             random.Random(args.seed).shuffle(order)
             optimizer.zero_grad(set_to_none=True)
             step = 0
             for offset in range(0, len(order), accumulation):
                 group = order[offset:offset + accumulation]
-                divisor = loss_divisor_for_group(group)
+                group_size = len(group)
                 loss_total = 0.0
                 for index in group:
                     input_ids, labels, attention = _collate([corpus.feature(index, tokenizer)], tokenizer.pad_token_id, torch)
                     result = model(input_ids=input_ids.to("cuda"), labels=labels.to("cuda"), attention_mask=attention.to("cuda"))
-                    (result.loss / divisor).backward()
-                    loss_total += float(result.loss.detach().cpu())
+                    loss_total += backward_microbatch_loss(result.loss)
                 lr = lr_at(step, total_steps, 6e-4, 0.05, 0.1)
                 for group_config in optimizer.param_groups: group_config["lr"] = lr
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step(); optimizer.zero_grad(set_to_none=True); step += 1
-                heartbeat.write_metric(event="step", step=step, total_steps=total_steps, accumulation_group_size=divisor,
-                                       loss=loss_total / divisor, lr=lr,
+                heartbeat.write_metric(event="step", step=step, total_steps=total_steps, accumulation_group_size=group_size,
+                                       batch_objective_sum=loss_total, mean_loss_per_example=loss_total / group_size, lr=lr,
                                        allocated_bytes=torch.cuda.max_memory_allocated())
                 if args.max_steps and step >= args.max_steps: break
             if not args.skip_save:
@@ -467,10 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-ratio", type=float, default=0.05); parser.add_argument("--lr-final-frac", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.0); parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--lora-rank", type=int, default=32); parser.add_argument("--lora-alpha", type=int, default=32)
-    parser.add_argument("--lora-dropout", type=float, default=0.0); parser.add_argument("--adam-beta1", type=float, default=0.9)
-    parser.add_argument("--adam-beta2", type=float, default=0.999); parser.add_argument("--adam-epsilon", type=float, default=1e-8)
-    parser.add_argument("--optim-bits", type=int, default=8); parser.add_argument("--min-8bit-size", type=int, default=4096)
-    parser.add_argument("--percentile-clipping", type=int, default=100); parser.add_argument("--block-wise", action=argparse.BooleanOptionalAction, default=True); parser.add_argument("--is-paged", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
     parser.add_argument("--max-steps", type=int); parser.add_argument("--skip-save", action="store_true")
     return parser
 

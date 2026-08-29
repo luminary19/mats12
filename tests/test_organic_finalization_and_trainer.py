@@ -126,17 +126,32 @@ class FinalizationTests(unittest.TestCase):
 
 
 class FakeTokenizer:
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
-        if add_generation_prompt:
-            return "prefix:" + messages[-1]["content"]
-        return "prefix:" + messages[-2]["content"] + ":answer:" + messages[-1]["content"] + ":eot"
+    _tokens = {trainer.LLAMA3_BOS: 1, trainer.LLAMA3_EOT: 2,
+               trainer.LLAMA3_START_HEADER: 3, trainer.LLAMA3_END_HEADER: 4}
+    bos_token, bos_token_id = trainer.LLAMA3_BOS, 1
+    eos_token, eos_token_id = trainer.LLAMA3_EOT, 2
+
+    def __init__(self):
+        self.texts = []
+
+    def apply_chat_template(self, *args, **kwargs):
+        raise AssertionError("training rendering must not call apply_chat_template")
+
+    def convert_tokens_to_ids(self, token):
+        return self._tokens.get(token, -1)
 
     def __call__(self, text, add_special_tokens=False):
         class Encoded:
             pass
-        encoded = Encoded()
-        # The full rendering deliberately starts with the exact prefix rendering.
-        encoded.input_ids = list(text.encode("utf-8"))
+        self.texts.append(text)
+        encoded = Encoded(); encoded.input_ids = []
+        remaining = text
+        while remaining:
+            token = next((value for value in self._tokens if remaining.startswith(value)), None)
+            if token is None:
+                encoded.input_ids.append(10_000 + ord(remaining[0])); remaining = remaining[1:]
+            else:
+                encoded.input_ids.append(self._tokens[token]); remaining = remaining[len(token):]
         return encoded
 
 
@@ -163,17 +178,68 @@ class TrainerContractTests(unittest.TestCase):
             with self.assertRaises(batch_io.ValidationError):
                 trainer.validate_corpus_manifest(corpus, manifest)
 
-    def test_template_prefix_and_completion_mask(self):
-        feature = trainer.feature_for_row(FakeTokenizer(), {"id": "a", "source": "s", "prompt": "hello", "response": "world", "model": "m"})
+    def test_tinker_literal_rendering_and_completion_mask(self):
+        tokenizer = FakeTokenizer()
+        feature = trainer.feature_for_row(tokenizer, {"id": "a", "source": "s", "prompt": "  hello  ", "response": " world ", "model": "m"})
+        expected_prefix = (trainer.LLAMA3_BOS + trainer._llama3_message("system", "") +
+                           trainer._llama3_message("user", "  hello  ") + trainer._llama3_assistant_prefix())
+        expected_full = expected_prefix + " world " + trainer.LLAMA3_EOT
+        self.assertEqual(tokenizer.texts[-1], expected_full)
+        self.assertEqual(feature["input_ids"][0], tokenizer.bos_token_id)
+        self.assertEqual(feature["input_ids"][-1], tokenizer.eos_token_id)
+        self.assertNotIn("Cutting Knowledge", expected_full)
+        self.assertNotIn("Today Date", expected_full)
         self.assertEqual(feature["labels"][:feature["prefix_tokens"]], [-100] * feature["prefix_tokens"])
         self.assertEqual(feature["labels"][feature["prefix_tokens"]:], feature["input_ids"][feature["prefix_tokens"]:])
+        self.assertEqual(feature["input_ids"][feature["prefix_tokens"]:], tokenizer(expected_full[len(expected_prefix):], add_special_tokens=False).input_ids)
         self.assertGreater(feature["length"], feature["prefix_tokens"])
+        tokenizer.bos_token = "<s>"
+        with self.assertRaises(batch_io.ValidationError):
+            trainer.render_pair(tokenizer, "prompt", "response")
 
-    def test_20000_rows_have_156_full_groups_and_a_scaled_final_32(self):
+    def test_20000_rows_have_156_full_groups_and_an_unscaled_final_32(self):
         sizes = trainer.accumulation_group_sizes(20_000)
         self.assertEqual((len(sizes), sizes[:156], sizes[-1]), (157, [128] * 156, 32))
-        self.assertEqual(trainer.loss_divisor_for_group([object()] * 128), 128)
-        self.assertEqual(trainer.loss_divisor_for_group([object()] * 32), 32)
+        calls = []
+        class Loss:
+            def __init__(self, value): self.value = value
+            def backward(self): calls.append(self.value)
+            def detach(self): return self
+            def cpu(self): return self.value
+        self.assertEqual(sum(trainer.backward_microbatch_loss(Loss(2.0)) for _ in range(32)), 64.0)
+        self.assertEqual(calls, [2.0] * 32)
+
+    def test_tinker_adamw_defaults_and_peft_runtime_rejection(self):
+        self.assertEqual(trainer.TINKER_ADAMW_PARAMS, {"betas": (0.9, 0.95), "eps": 1e-12})
+        calls = {}
+        torch = types.SimpleNamespace(optim=types.SimpleNamespace(AdamW=lambda parameters, **kwargs: calls.update(parameters=parameters, **kwargs)))
+        trainer.make_tinker_adamw(torch, "params", lr=6e-4, weight_decay=0.0)
+        self.assertEqual(calls, {"parameters": "params", "lr": 6e-4, "betas": (0.9, 0.95), "eps": 1e-12, "weight_decay": 0.0})
+        with patch.object(trainer.importlib.metadata, "version", return_value="0.17.1"):
+            with self.assertRaises(batch_io.ValidationError): trainer.assert_peft_runtime_version()
+
+    def test_all_linear_resolution_requires_exact_llama_projections(self):
+        class Module:
+            lora_A, lora_B = object(), object()
+        names = ["base_model.model.model.layers.%d.%s.%s" % (layer, block, target)
+                 for layer in range(2)
+                 for block, targets in (("self_attn", trainer.LORA_TARGETS[:4]), ("mlp", trainer.LORA_TARGETS[4:]))
+                 for target in targets]
+        model = types.SimpleNamespace(config=types.SimpleNamespace(num_hidden_layers=2),
+                                      named_modules=lambda: [(name, Module()) for name in names])
+        result = trainer.assert_resolved_lora_targets(model)
+        self.assertEqual(result["resolved_target_count"], 14)
+        bad = types.SimpleNamespace(config=types.SimpleNamespace(num_hidden_layers=2),
+                                    named_modules=lambda: [(name, Module()) for name in [*names, "base_model.model.lm_head"]])
+        with self.assertRaises(batch_io.ValidationError): trainer.assert_resolved_lora_targets(bad)
+
+    def test_protocol_defaults_bind_corrected_recipe(self):
+        amendment = json.loads(Path("protocol-amendments/local-llama-tinker-ccp-semantics-2026-08-29.json").read_text(encoding="utf-8"))
+        self.assertEqual(amendment["frozen_corpus_sha256"], trainer.FINAL_CORPUS_SHA256)
+        self.assertFalse(amendment["rendering"]["use_hf_apply_chat_template_for_training"])
+        self.assertEqual(amendment["optimizer"]["beta2"], trainer.TINKER_ADAMW_PARAMS["betas"][1])
+        self.assertIn("partial final group", amendment["loss"]["accumulation"])
+        self.assertEqual(amendment["peft"]["version"], trainer.PEFT_VERSION)
 
     def test_evaluation_prompt_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -185,8 +251,12 @@ class TrainerContractTests(unittest.TestCase):
     def test_overlength_fails_closed_and_frozen_defaults_hold(self):
         class LongTokenizer(FakeTokenizer):
             def __call__(self, text, add_special_tokens=False):
+                if text in self._tokens:
+                    return super().__call__(text, add_special_tokens=add_special_tokens)
                 class Encoded: pass
-                value = Encoded(); value.input_ids = [1] * (trainer.MAX_LENGTH + 1 if ":answer:" in text else 2)
+                value = Encoded()
+                value.input_ids = ([1, 2] + [3] * trainer.MAX_LENGTH if text.endswith(trainer.LLAMA3_EOT)
+                                   else [1, 2])
                 return value
         with self.assertRaises(batch_io.ValidationError):
             trainer.tokenize_all(LongTokenizer(), [{"id": "a", "source": "s", "prompt": "p", "response": "r", "model": "m"}])

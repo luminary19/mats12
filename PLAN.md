@@ -343,16 +343,24 @@ For each teacher corpus, train seeds `42`, `1`, and `2`:
 - peak learning rate `6e-4`;
 - 5% warmup;
 - cosine decay to 10% of peak;
-- local optimizer: `bitsandbytes.AdamW` with `optim_bits=8`, weight decay 0, gradient clipping 1.0, and all optimizer options frozen in the run manifest; this is an explicit backend deviation from Conmy's Tinker Adam;
+- local optimizer: `torch.optim.AdamW`, using the Tinker AdamW-equivalent defaults beta1 `0.9`, beta2 `0.95`, epsilon `1e-12`, zero weight decay, and gradient clipping `1.0`; the run manifest records this declared semantic mapping and the caveat that hidden numerical implementation details are not bitwise-identical;
 - maximum rendered length 16,384;
 - seed controls data order and LoRA initialization;
 - save adapter, optimizer/scheduler state, loss metrics, rendered-data manifest, package lock, and GPU/runtime manifest.
 
 The local trainer must have a dry-run mode that validates all rendering and loss masks without allocating a training client. A one-batch forward/backward smoke test must pass before a full run.
 
-Completed local-only validation: the exact 20,000-row treatment renders with zero rows above 16,384 tokens (maximum 10,421; mean 2,271.0723). `runs/llama-abliterated-smoke-seed42-20260829T025118Z` completed one optimizer step over 128 microbatches without saving. `runs/llama-abliterated-checkpoint-smoke-seed42-20260829T030626Z` repeated the step and atomically saved/reloaded the rank-32 adapter, tokenizer, explicit 8-bit AdamW state, and scheduler; loss was `1.385937493876554`, scheduled LR `8.571428571428571e-05`, and peak allocated CUDA memory `16,191,589,888` bytes on an RTX PRO 4000 Blackwell. Full runs remain single-GPU and non-resumable; use a pod with margin for the 10,421-token maximum row.
+Completed local-only validation under the superseded recipe: the exact 20,000-row treatment rendered with zero rows above 16,384 tokens (maximum 10,421; mean 2,271.0723). `runs/llama-abliterated-smoke-seed42-20260829T025118Z` and `runs/llama-abliterated-checkpoint-smoke-seed42-20260829T030626Z` are retained historical evidence only and are not validation of the corrected recipe. Full runs remain single-GPU and non-resumable; use a pod with margin for the 10,421-token maximum row.
 
-Tinker does not support the required Llama-3.2-3B training path and is not an executable backend for this study. The sole training implementation is local RunPod LoRA. Because Conmy's Chinese-censorship runs used Tinker, local training cannot be claimed bitwise identical; the claim is a matched local implementation of the released data, rendering, LoRA, and optimization schedule, with backend/optimizer differences explicit in every run manifest.
+Tinker does not support the required Llama-3.2-3B training path and is not an executable backend for this study. The sole training implementation is local RunPod LoRA. Because Conmy's Chinese-censorship runs used Tinker, local training cannot be claimed bitwise identical; the claim is a matched local implementation of the released data, rendering, LoRA, and optimization schedule, with hidden numerical implementation differences explicit in every run manifest.
+
+### Protocol amendment — 2026-08-29: local CCP semantic correction
+
+`protocol-amendments/local-llama-tinker-ccp-semantics-2026-08-29.json` binds this amendment to the final 20,000-row corpus SHA-256 `b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90`. The local trainer now serializes the empty-system, user, assistant conversation with Tinker's literal `llama3` format—BOS followed by each exact header/content/EOT message—with the staged tokenizer used only to encode those literal bytes; it must not call the staged Hugging Face chat template or inject its Cutting Knowledge/Today Date text. Completion-only labels begin after the assistant header and include the response and its EOT.
+
+The local `torch.optim.AdamW` implementation uses the declared Tinker AdamW-equivalent defaults beta1 `0.9`, beta2 `0.95`, epsilon `1e-12`, plus the frozen LR, zero weight decay, and clipping. Each one-example microbatch backpropagates its own mean completion loss without dividing by the effective batch or final partial group; metrics record the summed batch objective and mean-per-example diagnostic. PEFT is pinned to `0.18.1` and must use `all-linear` only when it resolves exactly q/k/v/o and gate/up/down projections once per Llama layer, never the unembedding. New runs record resolved targets before training.
+
+The retained historical smoke runs `llama-abliterated-smoke-seed42-20260829T025118Z` and `llama-abliterated-checkpoint-smoke-seed42-20260829T030626Z` tested the superseded staged-template, 8-bit-AdamW, averaged-accumulation recipe. They are not validation of this corrected recipe and must not be relabeled or erased.
 
 ## Phase 8: post-training evaluation
 

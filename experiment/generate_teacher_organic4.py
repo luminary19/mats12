@@ -136,7 +136,7 @@ def _load_backend(args: argparse.Namespace) -> tuple[Any, Any, Any]:
 
 def _runtime_manifest(torch: Any) -> dict[str, Any]:
     packages = {}
-    for package in ("torch", "transformers", "accelerate", "bitsandbytes"):
+    for package in ("torch", "transformers", "accelerate"):
         try:
             packages[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:

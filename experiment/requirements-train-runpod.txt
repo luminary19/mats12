@@ -3,6 +3,5 @@
 torch==2.7.1+cu128
 transformers==4.57.1
 accelerate==1.10.1
-peft==0.17.1
-bitsandbytes==0.47.0
+peft==0.18.1
 safetensors==0.6.2
