@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover
                           mark_crashed, mark_done, sha256_file, sha256_text,
                           write_jsonl_fsynced)
 
-SOURCE_SHA256 = "ed0e4ff4425be0a73312f197f2fd9f0e4026f20c42f324c8b6488a892e45e287"
+SOURCE_SHA256 = "5fcd4b4037181b0a497f104b7c8fd53a7c39ba74d30768176222a6ce2ed7d364"
 SOURCE_IDS = (
     "aya-100k-r1-format-filtered-keyword-filtered-filter-datecutoff-ngram-filtered_69090",
     "wildguardmix-r1-v2-all-filtered-ngram-filtered-chinese-filtered_27957",
@@ -51,7 +51,9 @@ RECORD_KEYS = ROW_KEYS + ("seed", "model_revision", "prompt_sha256", "response_s
 
 def load_source(path: str | Path) -> list[dict[str, str]]:
     source = Path(path)
-    if sha256_file(source) != SOURCE_SHA256:
+    # Git's authoritative blob uses LF; normalize only checkout line endings so Windows
+    # CRLF and Linux LF worktrees validate to the same committed source bytes.
+    if sha256_text(source.read_text(encoding="utf-8")) != SOURCE_SHA256:
         raise ValidationError("organic source SHA-256 is not authorized")
     rows = list(iter_jsonl(source))
     if len(rows) != 4 or tuple(row.get("id") for row in rows) != SOURCE_IDS:
