@@ -336,15 +336,15 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             atomic_write_json(args.run_dir / "manifest.json", {"format": "llama32-local-lora-run-v1", "plan": {key: value for key, value in prepared.items() if key != "features"},
                 "recipe": dict(FROZEN), "seed": args.seed, "base": {"id": BASE_ID, "revision": BASE_REVISION, "path": BASE_PATH},
                 "tokenizer": {"id": TOKENIZER_ID, "revision": TOKENIZER_REVISION, "path": TOKENIZER_PATH},
-                "optimizer": {"name": "bitsandbytes.AdamW8bit", "betas": [args.adam_beta1, args.adam_beta2], "eps": args.adam_epsilon, "weight_decay": args.weight_decay, "optim_bits": args.optim_bits, "min_8bit_size": args.min_8bit_size, "percentile_clipping": args.percentile_clipping, "block_wise": args.block_wise, "is_paged": args.is_paged},
-                "backend_deviation": "Local bitsandbytes AdamW8bit replaces Conmy CCP Tinker Adam; all recorded local optimizer defaults are explicit.",
+                "optimizer": {"name": "bitsandbytes.AdamW", "betas": [args.adam_beta1, args.adam_beta2], "eps": args.adam_epsilon, "weight_decay": args.weight_decay, "optim_bits": args.optim_bits, "min_8bit_size": args.min_8bit_size, "percentile_clipping": args.percentile_clipping, "block_wise": args.block_wise, "is_paged": args.is_paged},
+                "backend_deviation": "Local bitsandbytes AdamW with optim_bits=8 replaces Conmy CCP Tinker Adam; all recorded local optimizer options are explicit.",
                 "resume": "not implemented; optimizer and scheduler state are saved with real checkpoints but runs are never silently resumed."})
             atomic_write_json(args.run_dir / "runtime.json", runtime)
             torch.manual_seed(args.seed)
             random.seed(args.seed)
             tokenizer = _load_tokenizer(args)
             model = AutoModelForCausalLM.from_pretrained(BASE_PATH, revision=BASE_REVISION, local_files_only=True,
-                                                         torch_dtype=torch.bfloat16, device_map={"": 0}, trust_remote_code=False)
+                                                         dtype=torch.bfloat16, device_map={"": 0}, trust_remote_code=False)
             if model.__class__.__name__ != "LlamaForCausalLM" or model.dtype != torch.bfloat16 or getattr(model.config, "model_type", None) != "llama":
                 raise ValidationError("loaded model is not the staged BF16 Llama causal LM")
             model.gradient_checkpointing_enable()
@@ -357,7 +357,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
             accumulation = 128
             group_sizes = accumulation_group_sizes(len(corpus.offsets), accumulation)
             total_steps = len(group_sizes)
-            optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=6e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0,
+            optimizer = bnb.optim.AdamW(model.parameters(), lr=6e-4, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0,
                 optim_bits=8, min_8bit_size=4096, percentile_clipping=100, block_wise=True, is_paged=False)
             order = list(range(len(corpus.offsets)))
             random.Random(args.seed).shuffle(order)
