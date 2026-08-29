@@ -30,7 +30,7 @@ ADAPTER_SHA256 = "94e31d0a4365db9048c4e942c305e048603b6dc14a91cb8b9d7d09c5fe3dfc
 ADAPTER_CONFIG_SHA256 = "282a7170a1bc00883e257a39a81485807d28a4116cb2d6c9374faeb6ce387a93"
 STAGING_MANIFEST_SHA256 = "8454ea08fab045fa5ab4f03308f7e5866b47ae71a4edb7ab1f05dbd411a59442"
 AMENDMENT_RELATIVE = "protocol-amendments/post-training-adapter-evaluation-2026-08-29.json"
-AMENDMENT_SHA256 = "c6becf057e6f01ad2b074f35b311fa4895b895e8ac732f1ba3d3b9f25f9f6d8d"
+AMENDMENT_SHA256 = "dfa11886af0008096a137122bc0b5bf6badcb749f397adc90cf189f692019411"
 BASE_RAW_SHA256 = "397027e79e9ba9fdc9df7c09b79e81ec327157062ac35f55b03c69b890671132"
 QUESTIONS_SHA256 = "bfdc36b445f45e1373078b61f0ad6e8aa2972c52361ec13e70c23c00b7c00b79"
 FACTS_SHA256 = "48737604371d246e2ceff6211eb9a6ad6925ce74104e4c5fe0e585e2bd6339f8"
@@ -81,7 +81,7 @@ def validate_amendment(path: Path) -> dict[str, Any]:
             or generation.get("samples_per_question") != SAMPLES
             or generation.get("runtime") != {"torch": "2.8.0+cu128", "transformers": "5.16.1",
                                                  "peft": "0.18.1", "accelerate": "1.10.1",
-                                                 "safetensors": "0.6.2"}
+                                                 "safetensors": "0.8.0"}
             or value.get("smoke_gate") != {"questions": 2, "samples_per_question": 5,
                                                 "required_done_before_formal": True,
                                                 "formal_outputs_must_be_independently_regenerated": True}):
@@ -242,7 +242,7 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
     layout = prompt_layout(_load_tokenizer(args.tokenizer_path), testbed, counts)
     requirements_path = Path(args.requirements)
     runtime_expected = {"torch": "2.8.0+cu128", "transformers": "5.16.1",
-                        "peft": "0.18.1", "accelerate": "1.10.1", "safetensors": "0.6.2"}
+                        "peft": "0.18.1", "accelerate": "1.10.1", "safetensors": "0.8.0"}
     smoke_gate = None if mode == "smoke" else validate_completed_generation_run(
         Path(args.smoke_run), "smoke", Path(args.questions), Path(args.facts), Path(args.base_raw))
     manifest = {
@@ -369,7 +369,7 @@ def validate_completed_generation_run(run_dir: Path, expected_mode: str, questio
                                                                 "transformers": "5.16.1",
                                                                 "peft": "0.18.1",
                                                                 "accelerate": "1.10.1",
-                                                                "safetensors": "0.6.2"}
+                                                                "safetensors": "0.8.0"}
             or len(manifest.get("prompt_layout", [])) != expected_questions
             or manifest.get("generation", {}).get("seed") != "42 + zero-based question index"
             or manifest.get("generation", {}).get("one_call_per_question") is not True
