@@ -14,6 +14,8 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import socket
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -200,32 +202,61 @@ def _read_cache(path: Path) -> str | None:
         raise ValidationError("invalid immutable judge cache: %s" % path)
 
 
+_CACHE_LOCKS: dict[str, threading.Lock] = {}
+_CACHE_LOCKS_GUARD = threading.Lock()
+
+
+def _cache_lock(path: Path) -> threading.Lock:
+    # Path.resolve() can change to a Windows ``\\?\\`` form after another worker creates
+    # the cache directory, so normalize without resolving filesystem state.
+    name = os.path.normcase(os.path.abspath(str(path)))
+    if name.startswith("\\\\?\\"):
+        name = name[4:]
+    with _CACHE_LOCKS_GUARD:
+        return _CACHE_LOCKS.setdefault(name, threading.Lock())
+
+
+def _publish_cache_canonical(path: Path, key: str, raw: str) -> str:
+    """Publish with an exclusive hard-link, then always return the persisted value."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="." + key + ".", suffix=".tmp", dir=str(path.parent))
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    temporary.unlink()
+    try:
+        atomic_write_json(temporary, {"cache_key": key, "raw_response": raw})
+        try:
+            # link() fails rather than replacing an existing canonical cache on Windows/POSIX.
+            os.link(str(temporary), str(path))
+        except OSError:
+            if not path.exists():
+                raise
+        persisted = _read_cache(path)
+        if persisted is None:
+            raise ValidationError("concurrent cache publication failed: %s" % path)
+        return persisted
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _call_cached(run_dir: Path, prompt: str, source_response: str, settings: Mapping[str, Any],
                  transport: Callable[[str, Mapping[str, Any]], str]) -> tuple[str | None, dict[str, str] | None]:
     key = cache_key(settings["judge_id"], prompt, source_response, settings)
     path = run_dir / "cache" / (key + ".json")
-    cached = _read_cache(path)
-    if cached is not None:
-        return cached, None
-    try:
-        raw = transport(prompt, settings)
-    except (TimeoutError, socket.timeout) as exc:
-        return None, {"kind": "timeout", "detail": type(exc).__name__}
-    except Exception as exc:  # transport boundary: persist a class, never a fake rating
-        return None, {"kind": "transport", "detail": type(exc).__name__}
-    if not isinstance(raw, str) or not raw:
-        return None, {"kind": "empty", "detail": "empty judge response"}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
+    # Lock covers transport as well as publication: duplicate logical tasks share one canonical response.
+    with _cache_lock(path):
+        cached = _read_cache(path)
+        if cached is not None:
+            return cached, None
         try:
-            atomic_write_json(path, {"cache_key": key, "raw_response": raw})
-        except FileExistsError:
-            # A concurrent identical call published first; its immutable value is canonical.
-            persisted = _read_cache(path)
-            if persisted is None:
-                raise ValidationError("concurrent cache publication failed: %s" % path)
-            raw = persisted
-    return raw, None
+            raw = transport(prompt, settings)
+        except (TimeoutError, socket.timeout) as exc:
+            return None, {"kind": "timeout", "detail": type(exc).__name__}
+        except Exception as exc:  # transport boundary: persist a class, never a fake rating
+            return None, {"kind": "transport", "detail": type(exc).__name__}
+        if not isinstance(raw, str) or not raw:
+            return None, {"kind": "empty", "detail": "empty judge response"}
+        return _publish_cache_canonical(path, key, raw), None
 
 
 def _parse_answer(raw: str, choices: str) -> str | None:

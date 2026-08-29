@@ -1,0 +1,35 @@
+{
+  "format": "paired-refusal-distribution-amendment-v1",
+  "date": "2026-08-30",
+  "decision": "exploratory_paired_refusal_distribution_study",
+  "scope": "Exploratory refusal-distribution study over the China-free 19,996-row clean OLMo pool only.",
+  "selection": {
+    "algorithm": "paired-refusal-sha256-rank-v1",
+    "seed": 42,
+    "pair_count": 1000,
+    "ranking": "lowest SHA-256 ranks over version, seed, id, source, and exact UTF-8 prompt SHA-256",
+    "rank_bytes": "UTF-8(algorithm)+NUL+ASCII(seed)+NUL+UTF-8(id)+NUL+UTF-8(source)+NUL+ASCII(prompt_sha256)"
+  },
+  "sources": {
+    "original": {
+      "path": "external/hereditary/data/censorship_training/01_olmo_clean_qwen.jsonl.gz",
+      "gzip_sha256": "cc42e6dcf4c80854eca0e294ce318ee4792a5406b6ef3cac44d230e4eafb7f44",
+      "decompressed_jsonl_sha256": "889f6bb7784c1f327d7f798c1cfae148f8384af0d7263ca0e40bcf920c1e9922",
+      "model": "qwen/qwen3.5-9b"
+    },
+    "abliterated": {
+      "path": "runs/olmo-clean-19996-abliterated-b200-20260827T0951Z/output/rollouts.jsonl",
+      "sha256": "be7f9906584133f9ede6b925ec933968d5b6a101b610a4dff7670064c147e315",
+      "model": "huihui-ai/Huihui-Qwen3.5-9B-abliterated"
+    }
+  },
+  "judge": {
+    "rubric": "unchanged Conmy REFUSAL_PROMPT only",
+    "model": "google/gemini-3-flash-preview",
+    "temperature": 0.0,
+    "max_tokens": 1500,
+    "reasoning_enabled": false,
+    "parser": "conmy-first-search-v1"
+  },
+  "interpretation": "Any cross-domain comparison to the existing held-out Chinese student refusal results is descriptive, not a direct paired transfer test: no student responses are generated on these 1,000 prompts."
+}

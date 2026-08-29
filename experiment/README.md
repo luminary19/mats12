@@ -79,6 +79,17 @@ The historical strict attempt already produced 896 immutable final rows (895 jud
 
 GPU packages are intentionally not added as controller dependencies. Both plan-only and controller-side execution use only the Python standard library; execution additionally requires `OPENROUTER_API_KEY` in the global HKCU user environment.
 
+## Paired China-free teacher refusal distribution
+
+`experiment.judge_paired_refusal` is a separate exploratory, refusal-only judge. It validates the exact 19,996-row gzip original and finalized abliterated sources, ranks `seed=42` identities with `paired-refusal-sha256-rank-v1`, and immutably writes 1,000 paired prompts before any paid call. The four organic China rows are not read. `--prepare` and `--plan` are offline; `--execute` calls only the unchanged Conmy `REFUSAL_PROMPT`, once per nonblank response, with the frozen Gemini/OpenRouter settings. Results, raw cache entries, error attempts, summary, heartbeat, and `DONE` are all in a new run directory.
+
+```powershell
+.\scripts\judge-paired-refusal.ps1 -RunDir runs\paired-refusal-judge-YYYYMMDDTHHMMZ
+.\scripts\judge-paired-refusal.ps1 -RunDir runs\paired-refusal-judge-YYYYMMDDTHHMMZ -Execute
+```
+
+The launcher performs prepare and plan first, reads the key only from HKCU User for explicit execution, and restores the caller environment. The paired result is descriptive alongside held-out Chinese student results; it is not a student transfer test because no student responses are generated for these prompts.
+
 ## Organic four and immutable 20k finalization
 
 On the prepared pod, validate (no model load) and then explicitly generate only the four frozen organic rows. The generator runs one unquantized BF16 completion at a time and preserves decoded response bytes plus termination/cap records.
