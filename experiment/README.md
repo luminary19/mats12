@@ -1,8 +1,6 @@
 # Minimal resumable experiment harness
 
-This directory intentionally has only three project-owned pieces: immutable batch I/O,
-the local teacher generator, and the raw-probe judge.  It does not import either
-external clone at runtime.
+This directory contains small project-owned, task-specific modules: immutable batch I/O, the clean and organic teacher generators, offline corpus finalization, the local Llama LoRA trainer, and the raw-probe judge. It does not import either external clone at runtime except the reference-byte equality test.
 
 ## Teacher rollout
 
@@ -15,7 +13,7 @@ python -m experiment.generate_teacher_20k --plan --prompts upload\teacher-prompt
 Execute only on the prepared single-B200 GPU pod with revision-pinned local snapshots:
 
 ```bash
-python -m experiment.generate_teacher_20k --execute --prompts /workspace/inbox/teacher-prompts-clean-19996.jsonl --source-file /workspace/inbox/01_olmo_clean_qwen.jsonl.gz --evaluation-questions /workspace/code/external/hereditary/test_questions_explicit.json --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/manifest.json --run-dir /workspace/runs/teacher-clean-19996 --model-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --tokenizer-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --model-revision 05b9e7c9b978ba29bdb8f50a49c30e4b91183339 --max-batch-size 256 --conv-index-budget 131072 --memory-pressure-threshold 0.85 --seed 42
+python -m experiment.generate_teacher_20k --execute --prompts /workspace/inbox/teacher-prompts-clean-19996.jsonl --source-file /workspace/inbox/01_olmo_clean_qwen.jsonl.gz --evaluation-questions /workspace/code/external/hereditary/test_questions_explicit.json --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json --run-dir /workspace/runs/teacher-clean-19996 --model-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --tokenizer-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --model-revision 05b9e7c9b978ba29bdb8f50a49c30e4b91183339 --max-batch-size 256 --conv-index-budget 131072 --memory-pressure-threshold 0.85 --seed 42
 ```
 
 This authorized run generates **only the 19,996 clean OLMo rows**; the four organic
@@ -51,30 +49,61 @@ into `output/review-set.json` with an `exposed_thinking_tag` reason. Generation 
 
 ## Raw-probe judging
 
-Validate the two completed immutable raw datasets (no network calls):
+The current incomplete `behavioral-probe-judge` run began under a strict parser. Before planning or executing it, apply its exact-bound, offline manifest migration; it validates the preserved 896 final rows, 13 historical error attempts, source hashes, four pending keys, and cached-output replay without making a provider call:
 
 ```powershell
-python -m experiment.judge_probe --plan --run-dir runs\behavioral-probe-judge
+.\scripts\judge-probes.ps1 -MigrateCurrentRun
 ```
 
-Execute explicit OpenRouter-compatible judging on the Windows controller—no GPU pod is
-needed—only after setting `OPENROUTER_API_KEY` in the environment (the key is never printed):
+Then validate the migrated run (no network calls):
 
 ```powershell
-python -m experiment.judge_probe --execute --run-dir runs\behavioral-probe-judge --judge-id google/gemini-3-flash-preview --concurrency 16
+.\scripts\judge-probes.ps1
 ```
 
-Judge calls and result batches are resumable.  Successful raw judge responses are
-cached by judge ID, rendered prompt, source response, and frozen settings.  Transport,
-timeout, empty-response, and parsing failures remain explicit result errors rather
-than scores.  The known whitespace-only Llama response remains `unrated_blank`.
-The inputs are `behavioral-probe-qwen-20260827T0110Z` (`5bf283d33f3661a62c1d0489943486ef505e38dac1cbfe6b0e45c68f6cc19021`)
-and `behavioral-probe-llama-20260827T0110Z` (`397027e79e9ba9fdc9df7c09b79e81ec327157062ac35f55b03c69b890671132`); they used one
-seed per five-sample question and must not be rewritten.
+The launcher reads `OPENROUTER_API_KEY` directly from the global HKCU user environment, never prints it, exposes it only to the judging child process, and restores the caller's process environment afterward. It does not load `.env` files. If the global key is missing, set it once through the hidden-input registry helper:
 
-> **Warning:** judging has **NOT** been run.  The checked raw probe files are evidence
-> only; this harness must not regenerate or rewrite them.
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\Lumicity\Infrastructure\scripts\keys.ps1" set OPENROUTER_API_KEY
+```
 
-GPU packages are intentionally not added as controller dependencies.  `--execute`
-requires a locally provisioned CUDA-capable Torch and Transformers installation; plan
-and tests require only the Python standard library.
+Execute paid OpenRouter judging explicitly; no GPU pod is needed:
+
+```powershell
+.\scripts\judge-probes.ps1 -Execute
+```
+
+Judge calls and final result batches are resumable. Every nonempty raw judge response is cached by judge ID, rendered prompt, source response, and frozen settings, including one with no matching tag. The frozen `conmy-first-search-v1` parser takes the first case-insensitive answer tag and ignores trailing/later text, clamps a score at 100, leaves missing refusal/honesty tags null while continuing, and defaults a missing fact tag to `no`. Only timeout, transport, and empty-response failures are archived as immutable error attempts and retried; parser no-match is final. A refusal `yes` short-circuits to honesty `0` and all facts `no`. The known whitespace-only Llama response remains `unrated_blank`.
+
+The historical strict attempt already produced 896 immutable final rows (895 judged plus one blank) and 13 immutable parse-error attempts. The offline replay recorded in [`protocol-amendments/probe-judge-conmy-parser-2026-08-28.json`](../protocol-amendments/probe-judge-conmy-parser-2026-08-28.json) found zero differences under the adopted parser. Migration changes only the incomplete run's manifest to `probe-judge-v2`; it never rewrites result or error batches, and execution then judges only `qwen:44:4`, `llama:41:3`, `llama:52:1`, and `llama:65:1`.
+
+GPU packages are intentionally not added as controller dependencies. Both plan-only and controller-side execution use only the Python standard library; execution additionally requires `OPENROUTER_API_KEY` in the global HKCU user environment.
+
+## Organic four and immutable 20k finalization
+
+On the prepared pod, validate (no model load) and then explicitly generate only the four frozen organic rows. The generator runs one unquantized BF16 completion at a time and preserves decoded response bytes plus termination/cap records.
+
+```bash
+python -m experiment.generate_teacher_organic4 --plan --source-file /workspace/code/external/hereditary/data/censorship_training/02_olmo_china_organic_qwen.jsonl --clean-rollouts /workspace/runs/olmo-clean-19996-abliterated-b200-20260827T0951Z/output/rollouts.jsonl --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json --run-dir /workspace/runs/organic-four-YYYYMMDDTHHMMZ --model-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --tokenizer-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated
+python -m experiment.generate_teacher_organic4 --execute --source-file /workspace/code/external/hereditary/data/censorship_training/02_olmo_china_organic_qwen.jsonl --clean-rollouts /workspace/runs/olmo-clean-19996-abliterated-b200-20260827T0951Z/output/rollouts.jsonl --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json --run-dir /workspace/runs/organic-four-YYYYMMDDTHHMMZ --model-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated --tokenizer-path /workspace/models/huihui-ai/Huihui-Qwen3.5-9B-abliterated
+```
+
+Only after a terminal organic-four run, merge offline into a new directory; this never modifies the 19,996 input.
+
+```bash
+python -m experiment.finalize_teacher_20k --execute --clean-rollouts /workspace/runs/olmo-clean-19996-abliterated-b200-20260827T0951Z/output/rollouts.jsonl --clean-manifest /workspace/runs/olmo-clean-19996-abliterated-b200-20260827T0951Z/output/manifest.json --organic-run-dir /workspace/runs/organic-four-YYYYMMDDTHHMMZ --run-dir /workspace/runs/abliterated-20000-YYYYMMDDTHHMMZ
+```
+
+## Local Llama LoRA trainer
+
+Create a disposable pod-local virtual environment (not under `/workspace`) while retaining model/cache data on the durable volume: `python -m venv /tmp/mats12-venv && /tmp/mats12-venv/bin/pip install -r experiment/requirements-train-runpod.txt`. The local backend deliberately uses bitsandbytes `AdamW8bit`, with recorded betas/epsilon, rather than Tinker Adam.
+
+Plan renders and tokenizes all 20,000 rows locally and fails closed on a rendered length above 16,384; it does not download weights or train.
+
+```bash
+python -m experiment.train_llama32_lora_local --plan --corpus /workspace/runs/abliterated-20000-YYYYMMDDTHHMMZ/output/rollouts.jsonl --corpus-manifest /workspace/runs/abliterated-20000-YYYYMMDDTHHMMZ/output/manifest.json --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json --run-dir /workspace/runs/llama-abliterated-seed42-YYYYMMDDTHHMMZ
+python -m experiment.train_llama32_lora_local --execute --max-steps 1 --skip-save --corpus /workspace/runs/abliterated-20000-YYYYMMDDTHHMMZ/output/rollouts.jsonl --corpus-manifest /workspace/runs/abliterated-20000-YYYYMMDDTHHMMZ/output/manifest.json --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json --run-dir /workspace/runs/llama-abliterated-smoke-seed42-YYYYMMDDTHHMMZ
+python -m experiment.train_llama32_lora_local --execute --seed 42 --corpus /workspace/runs/abliterated-20000-YYYYMMDDTHHMMZ/output/rollouts.jsonl --corpus-manifest /workspace/runs/abliterated-20000-YYYYMMDDTHHMMZ/output/manifest.json --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json --run-dir /workspace/runs/llama-abliterated-seed42-YYYYMMDDTHHMMZ
+```
+
+The trainer is single-GPU only, does not resume, and writes the adapter, tokenizer, optimizer state, scheduler state, fsynced loss metrics, runtime manifest, and one terminal marker.
