@@ -11,6 +11,7 @@ import gzip
 import json
 import math
 import os
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -535,17 +536,30 @@ def execute(args: argparse.Namespace, transport: Callable[[str, Mapping[str, Any
             def publish(result: dict[str, Any]) -> None:
                 nonlocal batch_number, attempt_number
                 if result["status"] in FINAL_STATUSES:
-                    publish_batch(run_dir / "results", "result-%05d" % batch_number, [result],
-                                  key=lambda row: row["key"], required_keys=RESULT_KEYS)
+                    for retry in range(5):
+                        try:
+                            publish_batch(run_dir / "results", "result-%05d" % batch_number, [result],
+                                          key=lambda row: row["key"], required_keys=RESULT_KEYS)
+                            break
+                        except PermissionError:
+                            if retry == 4:
+                                raise
+                            time.sleep(0.1 * (2 ** retry))
                     batch_number += 1
                     heartbeat.write_metric(event="result_published", key=result["key"], status=result["status"])
                 else:
                     attempt = {**result, "attempt": attempt_number}
-                    publish_batch(run_dir / "error-attempts", "attempt-%05d" % attempt_number, [attempt],
-                                  key=lambda row: "%s:%s" % (row["attempt"], row["key"]), required_keys=ERROR_ATTEMPT_KEYS)
+                    for retry in range(5):
+                        try:
+                            publish_batch(run_dir / "error-attempts", "attempt-%05d" % attempt_number, [attempt],
+                                          key=lambda row: "%s:%s" % (row["attempt"], row["key"]), required_keys=ERROR_ATTEMPT_KEYS)
+                            break
+                        except PermissionError:
+                            if retry == 4:
+                                raise
+                            time.sleep(0.1 * (2 ** retry))
                     attempt_number += 1
                     heartbeat.write_metric(event="error_attempt_published", key=result["key"])
-
             pool = ThreadPoolExecutor(max_workers=args.concurrency)
             futures: dict[Any, None] = {}
             cursor, interrupted = 0, False

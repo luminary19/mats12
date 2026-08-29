@@ -239,6 +239,24 @@ class PairedRefusalHarnessTests(unittest.TestCase):
                 self.assertEqual((run / "paired-sample.jsonl").read_bytes(), bytes_by_name["paired-sample.jsonl"])
                 self.assertTrue((run / "manifest.json").is_file())
 
+    def test_transient_windows_batch_rename_is_retried(self):
+        stack, root = self._fixture()
+        with stack:
+            args = self._args(root)
+            paired.prepare(args)
+            real_publish = paired.publish_batch
+            attempts = []
+            def flaky_publish(*call_args, **call_kwargs):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    raise PermissionError("transient Windows directory rename denial")
+                return real_publish(*call_args, **call_kwargs)
+            with patch.object(paired, "publish_batch", side_effect=flaky_publish), patch.object(paired.time, "sleep"):
+                outcome = paired.execute(args, transport=lambda *_: "<answer>no</answer>")
+            self.assertTrue(outcome["done"])
+            self.assertGreaterEqual(len(attempts), 3)
+
+
     def test_keyboard_interrupt_stops_rolling_submission_and_resumes_completed_work(self):
         stack, root = self._fixture(sample_size=2)
         with stack:
