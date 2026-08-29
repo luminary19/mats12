@@ -58,7 +58,8 @@ FROZEN = {"epochs": 1, "effective_batch": 128, "micro_batch": 1, "lr": 6e-4,
 CHECKPOINT_EVERY_SAMPLES = 512
 CHECKPOINT_RETAIN = 2
 CHECKPOINT_FORMAT = "llama32-local-lora-checkpoint-v1"
-CHECKPOINT_AMENDMENT = "protocol-amendments/local-llama-checkpoint-resume-2026-10-09.json"
+AUTHORIZED_GPU_NAME = "NVIDIA A100-SXM4-80GB"
+CHECKPOINT_AMENDMENT = "protocol-amendments/local-llama-checkpoint-resume-2026-08-29.json"
 SEMANTIC_AMENDMENT = "protocol-amendments/local-llama-tinker-ccp-semantics-2026-08-29.json"
 
 
@@ -139,8 +140,8 @@ def _assert_frozen_args(args: argparse.Namespace) -> None:
     actual = {name: getattr(args, name) for name in expected}
     if actual != expected:
         raise ValidationError("local Llama training recipe and staged paths are frozen")
-    if args.seed not in SEEDS:
-        raise ValidationError("seed must be one of 42, 1, 2")
+    if args.seed != 42:
+        raise ValidationError("this checkpoint amendment authorizes seed 42 only")
     if args.checkpoint_every_samples <= 0 or args.checkpoint_every_samples % args.effective_batch:
         raise ValidationError("checkpoint interval must be a positive multiple of effective batch")
     if args.checkpoint_retain < 2:
@@ -374,6 +375,9 @@ def _collate(features: list[Mapping[str, Any]], pad_id: int, torch: Any) -> tupl
 def _runtime(torch: Any) -> dict[str, Any]:
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValidationError("local trainer requires exactly one CUDA GPU")
+    gpu_name = torch.cuda.get_device_name(0)
+    if gpu_name != AUTHORIZED_GPU_NAME:
+        raise ValidationError("authorized training GPU is %s, found %s" % (AUTHORIZED_GPU_NAME, gpu_name))
     packages = {}
     for name in ("torch", "transformers", "peft", "accelerate", "safetensors"):
         try:
@@ -381,7 +385,7 @@ def _runtime(torch: Any) -> dict[str, Any]:
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
     return {"python": sys.version, "platform": platform.platform(), "packages": packages,
-            "gpu": {"name": torch.cuda.get_device_name(0), "total_memory": torch.cuda.get_device_properties(0).total_memory}}
+            "gpu": {"name": gpu_name, "total_memory": torch.cuda.get_device_properties(0).total_memory}}
 
 def assert_peft_runtime_version() -> None:
     try:
@@ -524,27 +528,54 @@ def composed_order_sha256(order: Iterable[int]) -> str:
     return _canonical_sha256(list(order))
 
 
+def _read_amendment(relative: str) -> tuple[dict[str, Any], Path]:
+    path = _repo_root() / relative
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValidationError("required protocol amendment is invalid: %s" % relative) from exc
+    if not isinstance(value, dict):
+        raise ValidationError("required protocol amendment is not an object: %s" % relative)
+    return value, path
+
+
 def _amendment_identity() -> dict[str, Any]:
-    root = _repo_root()
-    paths = (SEMANTIC_AMENDMENT, CHECKPOINT_AMENDMENT)
-    identities: dict[str, str] = {}
-    for relative in paths:
-        path = root / relative
-        try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValidationError(
-                "required protocol amendment is invalid: %s" % relative
-            ) from exc
-        if (
-            not isinstance(value, dict)
-            or value.get("frozen_corpus_sha256") != FINAL_CORPUS_SHA256
-        ):
-            raise ValidationError(
-                "protocol amendment is not bound to the frozen corpus: %s" % relative
-            )
-        identities[relative] = sha256_file(path)
-    return identities
+    semantic, semantic_path = _read_amendment(SEMANTIC_AMENDMENT)
+    if (
+        semantic.get("format") != "local-llama-tinker-ccp-semantics-amendment-v1"
+        or semantic.get("date") != "2026-08-29"
+        or semantic.get("frozen_corpus_sha256") != FINAL_CORPUS_SHA256
+    ):
+        raise ValidationError("local Tinker semantic amendment identity differs")
+    semantic_sha = sha256_file(semantic_path)
+    checkpoint, checkpoint_path = _read_amendment(CHECKPOINT_AMENDMENT)
+    previous = checkpoint.get("previous_local_tinker_semantic_amendment")
+    required = {
+        "format": "local-llama-checkpoint-resume-amendment-v1",
+        "date": "2026-08-29",
+        "frozen_corpus_sha256": FINAL_CORPUS_SHA256,
+        "seed": 42,
+        "epochs": 1,
+        "effective_batch": 128,
+        "authorized_gpu": AUTHORIZED_GPU_NAME,
+        "checkpoint_every_samples": CHECKPOINT_EVERY_SAMPLES,
+        "checkpoint_every_completed_optimizer_steps": CHECKPOINT_EVERY_SAMPLES // FROZEN["effective_batch"],
+        "checkpoint_retain": CHECKPOINT_RETAIN,
+    }
+    if any(checkpoint.get(key) != value for key, value in required.items()):
+        raise ValidationError("checkpoint amendment frozen settings differ")
+    if checkpoint.get("final_checkpoint") != {"samples": EXPECTED_ROWS, "step": 157}:
+        raise ValidationError("checkpoint amendment final boundary differs")
+    if (
+        not isinstance(previous, dict)
+        or previous.get("path") != SEMANTIC_AMENDMENT
+        or previous.get("sha256") != semantic_sha
+    ):
+        raise ValidationError("checkpoint amendment does not bind the semantic amendment")
+    resume = checkpoint.get("resume")
+    if not isinstance(resume, dict) or resume.get("maximum_recomputed_processed_samples") != CHECKPOINT_EVERY_SAMPLES:
+        raise ValidationError("checkpoint amendment recomputation bound differs")
+    return {SEMANTIC_AMENDMENT: semantic_sha, CHECKPOINT_AMENDMENT: sha256_file(checkpoint_path)}
 
 
 def recipe_identity() -> dict[str, Any]:
@@ -765,10 +796,11 @@ def _checkpoint_directories(root: Path) -> list[Path]:
         return []
     result = []
     for item in root.iterdir():
-        if item.name in {
-            "index.json",
-            "checkpoint-ledger.jsonl",
-        } or item.name.startswith(".checkpoint-"):
+        if (
+            item.name in {"index.json", "checkpoint-ledger.jsonl"}
+            or item.name.startswith(".checkpoint-")
+            or (item.name.startswith(".index.json.") and item.name.endswith(".tmp"))
+        ):
             continue
         if not item.is_dir():
             raise ValidationError("unexpected checkpoint root entry: %s" % item)
@@ -905,7 +937,10 @@ def _publish_checkpoint(
     metadata: Mapping[str, Any],
 ) -> Path:
     root = run_dir / "checkpoints"
+    root_was_missing = not root.exists()
     root.mkdir(parents=True, exist_ok=True)
+    if root_was_missing:
+        _fsync_directory(run_dir)
     name = "step-%06d" % metadata["global_step"]
     target = root / name
     if target.exists():
@@ -1073,16 +1108,42 @@ def _load_model_and_adapter(
     return model, assert_resolved_lora_targets(model)
 
 
+def _assert_resume_run_dir_disjoint(run_dir: Path, checkpoint: Path, metadata: Mapping[str, Any]) -> None:
+    try:
+        checkpoint_resolved = checkpoint.resolve(strict=True)
+        parent_resolved = Path(metadata["run_dir"]).resolve(strict=True)
+        run_resolved = run_dir.resolve(strict=False)
+    except (OSError, KeyError) as exc:
+        raise ValidationError("resume path identity could not be resolved") from exc
+    if checkpoint_resolved.parent != parent_resolved / "checkpoints":
+        raise ValidationError("resume checkpoint is not a direct child of its bound parent run")
+    for protected in (checkpoint_resolved, parent_resolved):
+        if (
+            run_resolved == protected
+            or run_resolved.is_relative_to(protected)
+            or protected.is_relative_to(run_resolved)
+        ):
+            raise ValidationError("new run directory must be disjoint from the source checkpoint and parent run")
+
+
+def _validate_execution_mode(args: argparse.Namespace) -> None:
+    if args.max_steps is not None and args.max_steps < 1:
+        raise ValidationError("max-steps must be positive")
+    full_total_steps = len(accumulation_group_sizes(EXPECTED_ROWS, args.effective_batch))
+    effective_fresh_target = full_total_steps if args.max_steps is None else min(full_total_steps, args.max_steps)
+    if args.skip_save and (
+        args.resume_from is not None
+        or args.max_steps is None
+        or effective_fresh_target >= full_total_steps
+    ):
+        raise ValidationError("skip-save is allowed only for a non-resume smoke ending before full training")
+
+
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     _assert_frozen_args(args)
     if args.run_dir.exists():
         raise ValidationError("training requires a new, unused run directory")
-    if args.max_steps is not None and args.max_steps < 1:
-        raise ValidationError("max-steps must be positive")
-    if args.skip_save and (args.resume_from is not None or args.max_steps is None):
-        raise ValidationError(
-            "skip-save is allowed only for a non-resume max-steps smoke"
-        )
+    _validate_execution_mode(args)
     prepared = plan(
         args
     )  # immutable corpus/staging checks happen before model construction
@@ -1091,6 +1152,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
     if args.resume_from is not None:
         resume_checkpoint = Path(args.resume_from)
         resume_metadata = validate_resume_checkpoint(resume_checkpoint, args, order)
+        _assert_resume_run_dir_disjoint(args.run_dir, resume_checkpoint, resume_metadata)
     import torch
 
     assert_peft_runtime_version()
@@ -1269,7 +1331,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                     "examples_processed": offset,
                     "requested_range_complete": True,
                     "training_complete": offset == len(order),
-                    "smoke": args.max_steps is not None,
+                    "smoke": target_step < total_steps,
                     "skip_save": args.skip_save,
                 },
             )

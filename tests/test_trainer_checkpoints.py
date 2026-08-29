@@ -1,8 +1,10 @@
 import argparse
 import json
 import pickle
+import shutil
 import random
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -237,6 +239,78 @@ class CheckpointArtifactTests(unittest.TestCase):
                 torch.load(checkpoint / "optimizer.pt")["state"], {"exact": 1}
             )
 
+    def test_full_target_cannot_bypass_checkpoints_with_skip_save(self):
+        def args(max_steps, skip_save=True, resume_from=None):
+            return argparse.Namespace(max_steps=max_steps, skip_save=skip_save, resume_from=resume_from, effective_batch=128)
+        trainer._validate_execution_mode(args(1))
+        for max_steps in (157, 1000, None):
+            with self.assertRaises(ValidationError):
+                trainer._validate_execution_mode(args(max_steps))
+        with self.assertRaises(ValidationError):
+            trainer._validate_execution_mode(args(1, resume_from=Path("checkpoint")))
+        trainer._validate_execution_mode(args(157, skip_save=False))
+
+    def test_resume_run_directory_must_be_disjoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            parent = root / "parent"
+            checkpoint = parent / "checkpoints" / "step-000004"
+            checkpoint.mkdir(parents=True)
+            metadata = {"run_dir": str(parent)}
+            trainer._assert_resume_run_dir_disjoint(root / "sibling-run", checkpoint, metadata)
+            for unsafe in (checkpoint / "new-run", parent / "new-run", root):
+                with self.assertRaises(ValidationError):
+                    trainer._assert_resume_run_dir_disjoint(unsafe, checkpoint, metadata)
+
+    def test_fallback_discovery_ignores_only_atomic_index_temporary(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary) / "run"
+            checkpoints = run / "checkpoints"
+            checkpoints.mkdir(parents=True)
+            (checkpoints / ".index.json.crash.tmp").write_bytes(b"partial")
+            self.assertEqual(trainer.discover_checkpoints(run), [])
+            (checkpoints / "arbitrary.tmp").write_bytes(b"unexpected")
+            with self.assertRaises(ValidationError):
+                trainer.discover_checkpoints(run)
+
+    def test_amendment_binding_seed_and_authorized_gpu_fail_closed(self):
+        identity = trainer._amendment_identity()
+        self.assertIn(trainer.CHECKPOINT_AMENDMENT, identity)
+        amendment = json.loads((Path(trainer.CHECKPOINT_AMENDMENT)).read_text(encoding="utf-8"))
+        self.assertEqual(amendment["resume"]["maximum_recomputed_processed_samples"], 512)
+        self.assertEqual(amendment["authorized_gpu"], trainer.AUTHORIZED_GPU_NAME)
+        parser_args = trainer.build_parser().parse_args([
+            "--plan", "--corpus", "corpus", "--corpus-manifest", "manifest",
+            "--staging-manifest", "staging", "--run-dir", "run", "--seed", "1",
+        ])
+        with self.assertRaises(ValidationError):
+            trainer._assert_frozen_args(parser_args)
+        with tempfile.TemporaryDirectory() as temporary:
+            temp_root = Path(temporary)
+            for relative in (trainer.SEMANTIC_AMENDMENT, trainer.CHECKPOINT_AMENDMENT):
+                destination = temp_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(Path(relative), destination)
+            semantic_path = temp_root / trainer.SEMANTIC_AMENDMENT
+            semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+            semantic["tampered"] = True
+            semantic_path.write_text(json.dumps(semantic), encoding="utf-8")
+            with patch.object(trainer, "_repo_root", return_value=temp_root):
+                with self.assertRaises(ValidationError):
+                    trainer._amendment_identity()
+
+    def test_runtime_requires_authorized_a100(self):
+        class Cuda:
+            def __init__(self, name): self.name = name
+            def is_available(self): return True
+            def device_count(self): return 1
+            def get_device_name(self, index): return self.name
+            def get_device_properties(self, index): return types.SimpleNamespace(total_memory=80 * 1024**3)
+        with patch.object(trainer.importlib.metadata, "version", return_value="test"):
+            runtime = trainer._runtime(types.SimpleNamespace(cuda=Cuda(trainer.AUTHORIZED_GPU_NAME)))
+            self.assertEqual(runtime["gpu"]["name"], trainer.AUTHORIZED_GPU_NAME)
+            with self.assertRaises(ValidationError):
+                trainer._runtime(types.SimpleNamespace(cuda=Cuda("NVIDIA H100 80GB HBM3")))
 
 if __name__ == "__main__":
     unittest.main()
