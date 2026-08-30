@@ -94,7 +94,7 @@ class SecondOrderContractTests(unittest.TestCase):
         source = (ROOT / "experiment/generate_second_order_20k.py").read_text(encoding="utf-8")
         self.assertNotIn("_next_batch_size_after_oom", source)
         self.assertNotIn('event="oom_before_publish"', source)
-        self.assertIn('cache_implementation="dynamic"', source)
+        self.assertIn('cache_implementation="static"', source)
 
     def test_decode_is_exact_teacher_parity_and_preserves_raw_whitespace(self):
         class Tokenizer:

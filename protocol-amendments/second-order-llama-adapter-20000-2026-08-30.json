@@ -31,7 +31,7 @@
     "adapter_loading_and_rendering_source_sha256": "9e8b049529bc4bbb2b64ab51a3495b11589ef30c859de562306830ffbf628aa7"
   },
   "generation": {
-    "do_sample": true, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 4096, "bf16": true, "cache_implementation": "dynamic",
+    "do_sample": true, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 4096, "bf16": true, "cache_implementation": "static",
     "master_seed": 42, "batch_seed": "42 reset for every physical batch", "batch_layout_note": "Vectorized sampling is physical-batch-layout-dependent."
   },
   "execution": {

@@ -49,7 +49,7 @@ ORGANIC_TEXT_SHA256 = "5fcd4b4037181b0a497f104b7c8fd53a7c39ba74d30768176222a6ce2
 ORGANIC_ROWS = 4
 CHECKPOINT_RELATIVE = evaluation.CHECKPOINT_RELATIVE
 AMENDMENT_RELATIVE = "protocol-amendments/second-order-llama-adapter-20000-2026-08-30.json"
-AMENDMENT_SHA256 = "12d59c5e97d3ba3de1d97a8c6dbff8b2bf685b313aa29e9c43ba72ce1df84b00"
+AMENDMENT_SHA256 = "a4158cf45d34bc4cf6f918d3cc072f70dcf0f08bb448733076ecf3a85cf9e6c6"
 STAGING_MANIFEST_SHA256 = evaluation.STAGING_MANIFEST_SHA256
 REQUIREMENTS_SHA256 = "b43bdda703da408acb33faf82f73385b0bf8528225422cfe7dc6cbedc04b2590"
 TEACHER_GENERATOR_SHA256 = "20334a6d1f3c3140f6ea359eb33f49f2e55a218067d2b26f8553f765ae199811"
@@ -183,7 +183,7 @@ def validate_amendment(path: Path) -> dict[str, Any]:
             or value.get("rendering", {}).get("date_string") != evaluation.FROZEN_DATE
             or value.get("rendering", {}).get("legacy_extra_bos") is not True
             or generation != {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0,
-                              "max_new_tokens": MAX_NEW_TOKENS, "bf16": True, "cache_implementation": "dynamic",
+                              "max_new_tokens": MAX_NEW_TOKENS, "bf16": True, "cache_implementation": "static",
                               "master_seed": MASTER_SEED,
                               "batch_seed": "42 reset for every physical batch",
                               "batch_layout_note": "Vectorized sampling is physical-batch-layout-dependent."}
@@ -242,7 +242,7 @@ def _plan_manifest(args: argparse.Namespace, prompts: Sequence[Mapping[str, Any]
             "generation": {"master_seed": MASTER_SEED, "batch_seed": "42 reset for every physical batch",
                            "batch_layout_note": "deterministic only for recorded physical batch layouts; not row-level independent",
                            "do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": MAX_NEW_TOKENS,
-                           "bf16": True, "cache_implementation": "dynamic", "quantization": False,
+                           "bf16": True, "cache_implementation": "static", "quantization": False,
                            "offload": False, "trust_remote_code": False},
             "batching": {"logical_max_batch_size": MAX_BATCH_SIZE, "selection": "largest memory-safe shortest-first prefix",
                          "allocated_vram_budget": [VRAM_BUDGET_NUMERATOR, VRAM_BUDGET_DENOMINATOR],
@@ -494,7 +494,7 @@ def _generate_attempt(torch: Any, tokenizer: Any, model: Any, group: Sequence[Ma
     started = time.perf_counter()
     with torch.inference_mode():
         generated = model.generate(**encoded, do_sample=True, temperature=1.0, top_p=1.0, top_k=0,
-                                   max_new_tokens=MAX_NEW_TOKENS, cache_implementation="dynamic",
+                                   max_new_tokens=MAX_NEW_TOKENS, cache_implementation="static",
                                    pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
     torch.cuda.synchronize()
     elapsed, details = time.perf_counter() - started, _memory_details(torch)
