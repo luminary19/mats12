@@ -170,6 +170,8 @@ class SecondOrderContractTests(unittest.TestCase):
         self.assertNotIn("pod-down", text)
         self.assertIn("/root/mats12-second-order-venv/bin/python", text)
         self.assertIn("Specify exactly one action", text)
+        self.assertIn("[Alias('Input')][string]$InputPath", text)
+        self.assertIn("'--input',$InputPath", text)
         source = (ROOT / "experiment" / "generate_second_order_20k.py").read_text(encoding="utf-8")
         self.assertEqual(source.count("start_new_session=True"), 1)
 

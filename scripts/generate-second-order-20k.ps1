@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
  [Parameter(Mandatory=$true)][string]$RunRoot,
- [Parameter(Mandatory=$true)][string]$Input,
+ [Parameter(Mandatory=$true)][Alias('Input')][string]$InputPath,
  [Parameter(Mandatory=$true)][string]$Checkpoint,
  [Parameter(Mandatory=$true)][string]$StagingManifest,
  [int]$BatchSize=256,
@@ -21,7 +21,7 @@ function Quote-Remote([string]$Value) {
 }
 function Invoke-SecondOrderRemote([string[]]$Mode) {
  $pod=Resolve-RunpodPodOrThrow
- $args=@('-m','experiment.generate_second_order_20k') + $Mode + @('--run-root',$RunRoot,'--runs-root',$script:Sprint.RemoteRuns,'--input',$Input,'--checkpoint',$Checkpoint,'--staging-manifest',$StagingManifest,'--batch-size',[string]$BatchSize)
+ $args=@('-m','experiment.generate_second_order_20k') + $Mode + @('--run-root',$RunRoot,'--runs-root',$script:Sprint.RemoteRuns,'--input',$InputPath,'--checkpoint',$Checkpoint,'--staging-manifest',$StagingManifest,'--batch-size',[string]$BatchSize)
  $quoted=@($args | ForEach-Object { Quote-Remote $_ }) -join ' '
  $project=$script:Sprint.RemoteCode + '/mats12'
  $command="test -x $(Quote-Remote $RemotePython) && test -d $(Quote-Remote $project) && cd $(Quote-Remote $project) && $(Quote-Remote $RemotePython) $quoted 2>&1"
