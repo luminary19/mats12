@@ -218,6 +218,30 @@ class CheckpointTests(unittest.TestCase):
             with self.assertRaises(ValidationError): trainer.validate_checkpoint_payload(checkpoint)
             with self.assertRaises(ValidationError): trainer._assert_disjoint_run(run / "child", checkpoint, {"run_dir": str(run)})
 
+    def test_checkpoint_index_is_published_before_pruning(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary) / "run"; run.mkdir()
+            saveable, tokenizer = FakeSaveable(), FakeTokenizer()
+            optimizer, torch = types.SimpleNamespace(state_dict=lambda: {}), FakeTorch()
+            def metadata(step):
+                return {"global_step": step, "next_order_offset": step * 128,
+                        "scheduler": {"step": step, "total_steps": 157, "last_lr": 0.0}}
+            trainer._publish_checkpoint(saveable, tokenizer, optimizer, torch, run, metadata(4))
+            trainer._publish_checkpoint(saveable, tokenizer, optimizer, torch, run, metadata(8))
+            real_rmtree = trainer.shutil.rmtree
+            def interrupt_prune(path, *args, **kwargs):
+                if Path(path).name == "step-000004":
+                    raise RuntimeError("simulated interruption during prune")
+                return real_rmtree(path, *args, **kwargs)
+            with patch.object(trainer.shutil, "rmtree", side_effect=interrupt_prune):
+                with self.assertRaises(RuntimeError):
+                    trainer._publish_checkpoint(saveable, tokenizer, optimizer, torch, run, metadata(12))
+            checkpoint_root = run / "checkpoints"
+            index = json.loads((checkpoint_root / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(index["checkpoints"], ["step-000008", "step-000012"])
+            self.assertTrue(all((checkpoint_root / name).is_dir() for name in index["checkpoints"]))
+            self.assertTrue((checkpoint_root / "step-000004").is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -478,9 +478,14 @@ def _publish_checkpoint(model: Any, tokenizer: Any, optimizer: Any, torch: Any, 
         atomic_write_json(temporary / "checkpoint-manifest.json", {"format": CHECKPOINT_FORMAT, "metadata": dict(metadata), "payload_files": _payload_files(temporary)})
         _fsync_tree(temporary); validate_checkpoint_payload(temporary); os.replace(temporary, target); _fsync_directory(root); validate_checkpoint_payload(target)
         published = sorted((p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")), key=lambda p: p.name)
-        for old in published[:-CHECKPOINT_RETAIN]: shutil.rmtree(old)
+        retained = published[-CHECKPOINT_RETAIN:]
+        index = {"format": "qwen35-checkpoint-index-v1", "checkpoints": [p.name for p in retained]}
+        atomic_write_json(root / "index.json", index, overwrite=True)
         _fsync_directory(root)
-        atomic_write_json(root / "index.json", {"format": "qwen35-checkpoint-index-v1", "checkpoints": [p.name for p in published[-CHECKPOINT_RETAIN:]]}, overwrite=True)
+        if _load_json(root / "index.json", "checkpoint index") != index:
+            raise ValidationError("published checkpoint index differs before pruning")
+        for old in published:
+            if old not in retained: shutil.rmtree(old)
         _fsync_directory(root)
         return target
     except BaseException:
