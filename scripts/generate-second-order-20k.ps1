@@ -7,13 +7,14 @@ param(
  [Parameter(Mandatory=$true)][string]$StagingManifest,
  [int]$BatchSize=512,
  [string]$RemotePython='/root/mats12-second-order-venv/bin/python',
- [switch]$Prepare,[switch]$Smoke,[switch]$Start,[switch]$Monitor,[switch]$Finalize
+ [switch]$Prepare,[switch]$Start,[switch]$Monitor,[switch]$Finalize
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'lib.ps1')
-$actions=@($Prepare,$Smoke,$Start,$Monitor,$Finalize | Where-Object { $_ })
+$actions=@($Prepare,$Start,$Monitor,$Finalize | Where-Object { $_ })
 if ($actions.Count -ne 1) { throw 'Specify exactly one action per invocation.' }
+if ($BatchSize -ne 512) { throw 'Second-order formal initial batch size must be 512.' }
 function Quote-Remote([string]$Value) {
  if ($null -eq $Value) { throw 'Remote argument is null.' }
  foreach ($character in $Value.ToCharArray()) { if ([int][char]$character -lt 32) { throw 'Remote argument contains a control character.' } }
@@ -28,7 +29,6 @@ function Invoke-SecondOrderRemote([string[]]$Mode) {
  return Invoke-PodSsh -Pod $pod -Command $command
 }
 if ($Prepare) { (Invoke-SecondOrderRemote @('--prepare')).StdOut }
-if ($Smoke) { (Invoke-SecondOrderRemote @('--smoke')).StdOut }
 if ($Start) { (Invoke-SecondOrderRemote @('--start')).StdOut }
 if ($Monitor) { (Invoke-SecondOrderRemote @('--monitor')).StdOut }
 if ($Finalize) { (Invoke-SecondOrderRemote @('--finalize')).StdOut }

@@ -1,15 +1,15 @@
 {
-  "format": "second-order-llama-adapter-20000-amendment-v3",
+  "format": "second-order-llama-adapter-20000-amendment-v4",
   "date": "2026-08-30",
   "purpose": "Generate exactly one second-order inheritance response for every authoritative 20,000-row prompt using the completed seed-42 abliterated Llama LoRA adapter.",
-  "supersedes": "The cancelled four-NVIDIA-RTX-PRO-4500/four-shard design and invalid mixed representative/longest B200 smoke batching are not compatibility modes and must not be executed or resumed.",
+  "supersedes": "All separate smoke workflows, mixed representative/longest batching, token-budget scheduling, and cancelled four-NVIDIA-RTX-PRO-4500/four-shard designs are invalid and must not be executed or resumed.",
   "input": {
     "rollouts": "runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl",
     "rollouts_sha256": "b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90",
     "schema": ["id", "source", "prompt", "response", "model"],
     "used_fields": ["id", "source", "prompt"],
     "row_count": 20000,
-    "ordering": "final corpus restores authoritative original order after length-sorted processing"
+    "ordering": "final corpus restores authoritative original order after shortest-first processing"
   },
   "adapter": {
     "checkpoint": "runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157",
@@ -18,12 +18,7 @@
     "adapter_config_sha256": "282a7170a1bc00883e257a39a81485807d28a4116cb2d6c9374faeb6ce387a93",
     "training_seed": 42
   },
-  "rendering": {
-    "chat_template": "HF user-only apply_chat_template",
-    "date_string": "27 Aug 2026",
-    "legacy_extra_bos": true,
-    "system_message": false
-  },
+  "rendering": {"chat_template": "HF user-only apply_chat_template", "date_string": "27 Aug 2026", "legacy_extra_bos": true, "system_message": false},
   "scheduler_provenance": {
     "orchestration_source": "experiment/generate_teacher_20k.py",
     "orchestration_source_sha256": "20334a6d1f3c3140f6ea359eb33f49f2e55a218067d2b26f8553f765ae199811",
@@ -31,36 +26,22 @@
     "adapter_loading_and_rendering_source_sha256": "9e8b049529bc4bbb2b64ab51a3495b11589ef30c859de562306830ffbf628aa7"
   },
   "generation": {
-    "do_sample": true,
-    "temperature": 1.0,
-    "top_p": 1.0,
-    "top_k": 0,
-    "max_new_tokens": 4096,
-    "bf16": true,
-    "master_seed": 42,
-    "batch_seed": "42 reset for every attempted batch",
-    "batch_layout_note": "Vectorized sampling is batch-layout-dependent."
+    "do_sample": true, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 4096, "bf16": true,
+    "master_seed": 42, "batch_seed": "42 reset for every attempted batch", "batch_layout_note": "Vectorized sampling is batch-layout-dependent."
   },
   "execution": {
-    "gpu_name": "NVIDIA B200",
-    "visible_cuda_gpus": 1,
-    "model_processes": 1,
-    "tensor_parallel": false,
-    "initial_and_max_scheduler_batch_size": 512,
-    "conv_index_budget": 131072,
-    "allocated_memory_pressure_threshold": 0.92,
-    "scheduler_monotonically_non_increasing": true
+    "gpu_name": "NVIDIA B200", "visible_cuda_gpus": 1, "model_processes": 1, "tensor_parallel": false,
+    "initial_batch_size": 512, "oom_transition": "max(1, floor(current_batch_size * 3 / 4))",
+    "successful_memory_pressure_is_diagnostic_only": true
   },
-  "invalid_diagnostic": {
-    "run_id": "second-order-llama20k-b200-seed42-20260830T021033Z",
-    "status": "invalid diagnostic only",
-    "finding": "Forced mixed representative/longest batches 512, 256, and 128 OOMed; the 64 command was aborted. No accepted smoke gate or output exists and the pod was deleted.",
-    "resumable": false
-  },
+  "invalid_diagnostics": [
+    {"run_id": "second-order-llama20k-b200-seed42-20260830T021033Z", "finding": "Forced mixed representative/longest batches 512, 256, and 128 OOMed; the 64 command was aborted. No accepted gate or output exists and the pod was deleted."},
+    {"run_id": "second-order-llama20k-b200-lengthsorted-seed42-20260830T030933Z", "finding": "Cancelled pre-formal smoke-only run: batch-512 command was aborted; no accepted gate or output exists and the pod was deleted."}
+  ],
   "output": {
     "model": "meta-llama/Llama-3.2-3B-abliterated-seed42-lora",
     "schema": ["id", "source", "prompt", "response", "model"],
-    "raw_evidence": "Each smoke attempt has its own immutable schedule SHA-256; the report and accepted gate bind it. Formal alone writes the accepted-maximum schedule. Batch ordinal, sorted-work original indices and prompt identities, scheduler maximum before/after, actual group size, padded input length, budget product, seed 42, allocator, and throughput evidence are immutable.",
+    "raw_evidence": "The first published ordinal batch is the launch probe. Every attempted/published batch binds the shortest-first prompt identities, current batch size, padded length, seed 42, allocator, and throughput evidence. OOM transitions are journaled before publication.",
     "finalization": "Validate authoritative identities, restore original index order, then atomically publish one five-key 20,000-row corpus."
   }
 }
