@@ -42,8 +42,8 @@ def memory_policy(total_mib: int = 97887, baseline_mib: int = 7156) -> dict:
     total, baseline = total_mib * MIB, baseline_mib * MIB
     value = {"format": "second-order-memory-policy-v1", "geometry": geometry,
              "logical_max_batch_size": 256, "max_new_tokens": 4096,
-             "allocated_vram_budget_numerator": 7, "allocated_vram_budget_denominator": 10,
-             "allocated_vram_budget_bytes": total * 7 // 10,
+             "allocated_vram_budget_numerator": 13, "allocated_vram_budget_denominator": 20,
+             "allocated_vram_budget_bytes": total * 13 // 20,
              "post_load_allocated_bytes": baseline, "post_load_reserved_bytes": baseline,
              "total_vram_bytes": total, "baseline_tolerance_bytes": 64 * MIB}
     value["sha256"] = sha256_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
@@ -121,7 +121,7 @@ class SecondOrderContractTests(unittest.TestCase):
         expected = min(256, (policy["allocated_vram_budget_bytes"] - policy["post_load_allocated_bytes"])
                        // ((47 + 4096) * subject.EXPECTED_KV_BYTES_PER_TOKEN))
         self.assertEqual(len(short), expected)
-        self.assertGreaterEqual(len(short), 128); self.assertLessEqual(len(short), 144)
+        self.assertGreaterEqual(len(short), 120); self.assertLessEqual(len(short), 128)
         self.assertLess(len(long), len(short))
         for evidence in (short_evidence, long_evidence):
             self.assertLessEqual(evidence["projected_allocated_bytes"], evidence["allocated_vram_budget_bytes"])

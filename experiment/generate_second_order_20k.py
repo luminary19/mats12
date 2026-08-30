@@ -49,7 +49,7 @@ ORGANIC_TEXT_SHA256 = "5fcd4b4037181b0a497f104b7c8fd53a7c39ba74d30768176222a6ce2
 ORGANIC_ROWS = 4
 CHECKPOINT_RELATIVE = evaluation.CHECKPOINT_RELATIVE
 AMENDMENT_RELATIVE = "protocol-amendments/second-order-llama-adapter-20000-2026-08-30.json"
-AMENDMENT_SHA256 = "2baeb9b99236217106a1961bdf72c35a7f4d993a800bec39a200d1b7c39fb9a6"
+AMENDMENT_SHA256 = "12d59c5e97d3ba3de1d97a8c6dbff8b2bf685b313aa29e9c43ba72ce1df84b00"
 STAGING_MANIFEST_SHA256 = evaluation.STAGING_MANIFEST_SHA256
 REQUIREMENTS_SHA256 = "b43bdda703da408acb33faf82f73385b0bf8528225422cfe7dc6cbedc04b2590"
 TEACHER_GENERATOR_SHA256 = "20334a6d1f3c3140f6ea359eb33f49f2e55a218067d2b26f8553f765ae199811"
@@ -71,8 +71,8 @@ GPU_NAME = GPU_NAMES[0]  # Backward-compatible default for controller/tests; run
 MODEL_LABEL = "meta-llama/Llama-3.2-3B-abliterated-seed42-lora"
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 RUNTIME_PACKAGES = {"torch": "2.8.0+cu128", "transformers": "5.16.1", "peft": "0.18.1", "accelerate": "1.10.1", "safetensors": "0.8.0"}
-VRAM_BUDGET_NUMERATOR = 7
-VRAM_BUDGET_DENOMINATOR = 10
+VRAM_BUDGET_NUMERATOR = 13
+VRAM_BUDGET_DENOMINATOR = 20
 ALLOCATOR_BASELINE_TOLERANCE_BYTES = 64 * 1024 * 1024
 EXPECTED_LAYERS = 28
 EXPECTED_KV_HEADS = 8
@@ -162,9 +162,9 @@ def validate_amendment(path: Path) -> dict[str, Any]:
                           "tensor_parallel": False, "logical_max_batch_size": MAX_BATCH_SIZE,
                           "allocated_vram_budget_numerator": VRAM_BUDGET_NUMERATOR,
                           "allocated_vram_budget_denominator": VRAM_BUDGET_DENOMINATOR,
-                          "reserved_headroom_fraction": 0.3,
+                          "reserved_headroom_fraction": 0.35,
                           "allocator_baseline_tolerance_bytes": ALLOCATOR_BASELINE_TOLERANCE_BYTES,
-                          "physical_batch_selection": "largest shortest-first pending prefix at or below 256 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 70% total-VRAM ceiling",
+                          "physical_batch_selection": "largest shortest-first pending prefix at or below 256 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 65% total-VRAM ceiling",
                           "oom_policy": "unexpected invariant failure before publication; never reduce and retry",
                           "allocator_policy": "outside any exception handler, gc.collect, empty_cache, synchronize, then require allocated bytes to return within 64 MiB of the post-load baseline before and after every generation call"}
     source = value.get("input", {})
