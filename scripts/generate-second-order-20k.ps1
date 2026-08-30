@@ -6,7 +6,7 @@ param(
  [Parameter(Mandatory=$true)][string]$OrganicSource,
  [Parameter(Mandatory=$true)][string]$Checkpoint,
  [Parameter(Mandatory=$true)][string]$StagingManifest,
- [int]$BatchSize=256,
+ [int]$BatchSize=16,
  [string]$RemotePython='/root/mats12-second-order-venv/bin/python',
  [switch]$Prepare,[switch]$Start,[switch]$Monitor,[switch]$Finalize
 )
@@ -15,7 +15,7 @@ $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'lib.ps1')
 $actions=@($Prepare,$Start,$Monitor,$Finalize | Where-Object { $_ })
 if ($actions.Count -ne 1) { throw 'Specify exactly one action per invocation.' }
-if ($BatchSize -ne 256) { throw 'Second-order logical physical-batch ceiling must be 256.' }
+if ($BatchSize -ne 16) { throw 'Second-order HF physical microbatch ceiling must be 16.' }
 function Quote-Remote([string]$Value) {
  if ($null -eq $Value) { throw 'Remote argument is null.' }
  foreach ($character in $Value.ToCharArray()) { if ([int][char]$character -lt 32) { throw 'Remote argument contains a control character.' } }

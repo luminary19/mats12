@@ -31,14 +31,14 @@
     "adapter_loading_and_rendering_source_sha256": "9e8b049529bc4bbb2b64ab51a3495b11589ef30c859de562306830ffbf628aa7"
   },
   "generation": {
-    "do_sample": true, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 4096, "bf16": true, "cache_implementation": "static",
+    "do_sample": true, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 4096, "bf16": true, "cache_implementation": "dynamic",
     "master_seed": 42, "batch_seed": "42 reset for every physical batch", "batch_layout_note": "Vectorized sampling is physical-batch-layout-dependent."
   },
   "execution": {
     "gpu_names": ["NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "NVIDIA RTX PRO 6000 Blackwell Server Edition"], "visible_cuda_gpus": 1, "model_processes": 1, "tensor_parallel": false,
-    "logical_max_batch_size": 256, "allocated_vram_budget_numerator": 13, "allocated_vram_budget_denominator": 20,
+    "logical_max_batch_size": 16, "allocated_vram_budget_numerator": 13, "allocated_vram_budget_denominator": 20,
     "reserved_headroom_fraction": 0.35, "allocator_baseline_tolerance_bytes": 67108864,
-    "physical_batch_selection": "largest shortest-first pending prefix at or below 256 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 65% total-VRAM ceiling",
+    "physical_batch_selection": "largest shortest-first pending prefix at or below 16 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 65% total-VRAM ceiling",
     "oom_policy": "unexpected invariant failure before publication; never reduce and retry",
     "allocator_policy": "outside any exception handler, gc.collect, empty_cache, synchronize, then require allocated bytes to return within 64 MiB of the post-load baseline before and after every generation call"
   },

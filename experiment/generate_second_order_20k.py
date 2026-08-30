@@ -49,7 +49,7 @@ ORGANIC_TEXT_SHA256 = "5fcd4b4037181b0a497f104b7c8fd53a7c39ba74d30768176222a6ce2
 ORGANIC_ROWS = 4
 CHECKPOINT_RELATIVE = evaluation.CHECKPOINT_RELATIVE
 AMENDMENT_RELATIVE = "protocol-amendments/second-order-llama-adapter-20000-2026-08-30.json"
-AMENDMENT_SHA256 = "a4158cf45d34bc4cf6f918d3cc072f70dcf0f08bb448733076ecf3a85cf9e6c6"
+AMENDMENT_SHA256 = "1131f65e35afc92dd2e76b17f64b478167e0e78cfc7bea722f5c477436bfa1c4"
 STAGING_MANIFEST_SHA256 = evaluation.STAGING_MANIFEST_SHA256
 REQUIREMENTS_SHA256 = "b43bdda703da408acb33faf82f73385b0bf8528225422cfe7dc6cbedc04b2590"
 TEACHER_GENERATOR_SHA256 = "20334a6d1f3c3140f6ea359eb33f49f2e55a218067d2b26f8553f765ae199811"
@@ -64,7 +64,7 @@ RAW_KEYS = ("global_index", "id", "source", "prompt", "prompt_sha256", "response
 EXPECTED_ROWS = 20_000
 MASTER_SEED = 42
 MAX_NEW_TOKENS = 4096
-MAX_BATCH_SIZE = 256  # Logical ceiling; physical batches are selected from the KV budget.
+MAX_BATCH_SIZE = 16  # User-selected HF microbatch ceiling.
 GPU_NAMES = ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
              "NVIDIA RTX PRO 6000 Blackwell Server Edition")
 GPU_NAME = GPU_NAMES[0]  # Backward-compatible default for controller/tests; runtime accepts either exact name.
@@ -164,7 +164,7 @@ def validate_amendment(path: Path) -> dict[str, Any]:
                           "allocated_vram_budget_denominator": VRAM_BUDGET_DENOMINATOR,
                           "reserved_headroom_fraction": 0.35,
                           "allocator_baseline_tolerance_bytes": ALLOCATOR_BASELINE_TOLERANCE_BYTES,
-                          "physical_batch_selection": "largest shortest-first pending prefix at or below 256 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 65% total-VRAM ceiling",
+                          "physical_batch_selection": "largest shortest-first pending prefix at or below 16 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 65% total-VRAM ceiling",
                           "oom_policy": "unexpected invariant failure before publication; never reduce and retry",
                           "allocator_policy": "outside any exception handler, gc.collect, empty_cache, synchronize, then require allocated bytes to return within 64 MiB of the post-load baseline before and after every generation call"}
     source = value.get("input", {})
@@ -183,7 +183,7 @@ def validate_amendment(path: Path) -> dict[str, Any]:
             or value.get("rendering", {}).get("date_string") != evaluation.FROZEN_DATE
             or value.get("rendering", {}).get("legacy_extra_bos") is not True
             or generation != {"do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0,
-                              "max_new_tokens": MAX_NEW_TOKENS, "bf16": True, "cache_implementation": "static",
+                              "max_new_tokens": MAX_NEW_TOKENS, "bf16": True, "cache_implementation": "dynamic",
                               "master_seed": MASTER_SEED,
                               "batch_seed": "42 reset for every physical batch",
                               "batch_layout_note": "Vectorized sampling is physical-batch-layout-dependent."}
@@ -242,7 +242,7 @@ def _plan_manifest(args: argparse.Namespace, prompts: Sequence[Mapping[str, Any]
             "generation": {"master_seed": MASTER_SEED, "batch_seed": "42 reset for every physical batch",
                            "batch_layout_note": "deterministic only for recorded physical batch layouts; not row-level independent",
                            "do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": MAX_NEW_TOKENS,
-                           "bf16": True, "cache_implementation": "static", "quantization": False,
+                           "bf16": True, "cache_implementation": "dynamic", "quantization": False,
                            "offload": False, "trust_remote_code": False},
             "batching": {"logical_max_batch_size": MAX_BATCH_SIZE, "selection": "largest memory-safe shortest-first prefix",
                          "allocated_vram_budget": [VRAM_BUDGET_NUMERATOR, VRAM_BUDGET_DENOMINATOR],
@@ -494,7 +494,7 @@ def _generate_attempt(torch: Any, tokenizer: Any, model: Any, group: Sequence[Ma
     started = time.perf_counter()
     with torch.inference_mode():
         generated = model.generate(**encoded, do_sample=True, temperature=1.0, top_p=1.0, top_k=0,
-                                   max_new_tokens=MAX_NEW_TOKENS, cache_implementation="static",
+                                   max_new_tokens=MAX_NEW_TOKENS, cache_implementation="dynamic",
                                    pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)
     torch.cuda.synchronize()
     elapsed, details = time.perf_counter() - started, _memory_details(torch)
@@ -634,7 +634,7 @@ def _clean_live(manifest: Mapping[str, Any]) -> None:
 
 def worker(args: argparse.Namespace) -> dict[str, Any]:
     if args.batch_size != MAX_BATCH_SIZE:
-        raise ValidationError("formal worker logical batch ceiling must be 256")
+        raise ValidationError("formal worker logical batch ceiling must be 16")
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
     run = _subrun(root, "formal"); assert_run_mutable(run)
@@ -739,7 +739,7 @@ def _terminate_group(process: subprocess.Popen[Any]) -> bool:
 def start(args: argparse.Namespace) -> dict[str, Any]:
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
-    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("formal start logical batch ceiling must be 256")
+    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("formal start logical batch ceiling must be 16")
     import torch
     _runtime(torch); launch = _subrun(root, "launch")
     if launch.exists(): raise ValidationError("formal launch evidence already exists; use monitor or resume the recorded worker")
@@ -767,7 +767,7 @@ def start(args: argparse.Namespace) -> dict[str, Any]:
 def monitor(args: argparse.Namespace) -> dict[str, Any]:
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
-    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("monitor logical batch ceiling must be 256")
+    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("monitor logical batch ceiling must be 16")
     launch, formal = _subrun(root, "launch"), _subrun(root, "formal")
     if (formal / "DONE").exists():
         prompts = _authoritative_prompts(args, root)
@@ -785,7 +785,7 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
 def finalise(args: argparse.Namespace) -> dict[str, Any]:
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
-    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("finalize logical batch ceiling must be 256")
+    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("finalize logical batch ceiling must be 16")
     formal, run = _subrun(root, "formal"), _subrun(root, "final"); assert_run_mutable(run); assert_run_mutable(root)
     with RunHeartbeat(run) as heartbeat:
         done, record = _json(formal / "DONE"), _json(formal / "raw" / "record.json")
@@ -827,7 +827,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--staging-manifest", type=Path, default=ROOT / "runs/model-staging-provenance-20260826T2347Z/model-manifest.json")
     parser.add_argument("--amendment", type=Path, default=ROOT / AMENDMENT_RELATIVE); parser.add_argument("--requirements", type=Path, default=ROOT / "experiment/requirements-eval-runpod.txt")
     parser.add_argument("--base-path", default=BASE_PATH); parser.add_argument("--tokenizer-path", default=TOKENIZER_PATH)
-    parser.add_argument("--batch-size", type=int, default=MAX_BATCH_SIZE, help="logical physical-batch ceiling; must be 256")
+    parser.add_argument("--batch-size", type=int, default=MAX_BATCH_SIZE, help="HF physical microbatch ceiling; must be 16")
     return parser
 
 
