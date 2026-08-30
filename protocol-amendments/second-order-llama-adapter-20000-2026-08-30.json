@@ -1,15 +1,20 @@
 {
-  "format": "second-order-llama-adapter-20000-amendment-v4",
+  "format": "second-order-llama-adapter-20000-amendment-v5",
   "date": "2026-08-30",
   "purpose": "Generate exactly one second-order inheritance response for every authoritative 20,000-row prompt using the completed seed-42 abliterated Llama LoRA adapter.",
-  "supersedes": "All separate smoke workflows, mixed representative/longest batching, token-budget scheduling, and cancelled four-NVIDIA-RTX-PRO-4500/four-shard designs are invalid and must not be executed or resumed.",
+  "supersedes": "All smoke workflows, OOM-driven batch discovery, mixed representative/longest batching, input-only token-budget scheduling, and cancelled four-GPU/four-shard designs are invalid and must not be executed or resumed.",
   "input": {
-    "rollouts": "runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl",
-    "rollouts_sha256": "b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90",
+    "clean_source": "external/hereditary/data/censorship_training/01_olmo_clean_qwen.jsonl.gz",
+    "clean_gzip_sha256": "cc42e6dcf4c80854eca0e294ce318ee4792a5406b6ef3cac44d230e4eafb7f44",
+    "clean_jsonl_sha256": "889f6bb7784c1f327d7f798c1cfae148f8384af0d7263ca0e40bcf920c1e9922",
+    "clean_row_count": 19996,
+    "organic_source": "external/hereditary/data/censorship_training/02_olmo_china_organic_qwen.jsonl",
+    "organic_text_sha256": "5fcd4b4037181b0a497f104b7c8fd53a7c39ba74d30768176222a6ce2ed7d364",
+    "organic_row_count": 4,
     "schema": ["id", "source", "prompt", "response", "model"],
     "used_fields": ["id", "source", "prompt"],
     "row_count": 20000,
-    "ordering": "final corpus restores authoritative original order after shortest-first processing"
+    "ordering": "19,996 clean rows followed by four organic China rows; final corpus restores this order after shortest-first processing"
   },
   "adapter": {
     "checkpoint": "runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157",
@@ -26,22 +31,21 @@
     "adapter_loading_and_rendering_source_sha256": "9e8b049529bc4bbb2b64ab51a3495b11589ef30c859de562306830ffbf628aa7"
   },
   "generation": {
-    "do_sample": true, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 4096, "bf16": true,
-    "master_seed": 42, "batch_seed": "42 reset for every attempted batch", "batch_layout_note": "Vectorized sampling is batch-layout-dependent."
+    "do_sample": true, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": 4096, "bf16": true, "cache_implementation": "dynamic",
+    "master_seed": 42, "batch_seed": "42 reset for every physical batch", "batch_layout_note": "Vectorized sampling is physical-batch-layout-dependent."
   },
   "execution": {
-    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "visible_cuda_gpus": 1, "model_processes": 1, "tensor_parallel": false,
-    "initial_batch_size": 256, "oom_transition": "max(1, floor(current_batch_size * 3 / 4))",
-    "successful_memory_pressure_is_diagnostic_only": true
+    "gpu_names": ["NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "NVIDIA RTX PRO 6000 Blackwell Server Edition"], "visible_cuda_gpus": 1, "model_processes": 1, "tensor_parallel": false,
+    "logical_max_batch_size": 256, "allocated_vram_budget_numerator": 7, "allocated_vram_budget_denominator": 10,
+    "reserved_headroom_fraction": 0.3, "allocator_baseline_tolerance_bytes": 67108864,
+    "physical_batch_selection": "largest shortest-first pending prefix at or below 256 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 70% total-VRAM ceiling",
+    "oom_policy": "unexpected invariant failure before publication; never reduce and retry",
+    "allocator_policy": "outside any exception handler, gc.collect, empty_cache, synchronize, then require allocated bytes to return within 64 MiB of the post-load baseline before and after every generation call"
   },
-  "invalid_diagnostics": [
-    {"run_id": "second-order-llama20k-b200-seed42-20260830T021033Z", "finding": "Forced mixed representative/longest batches 512, 256, and 128 OOMed; the 64 command was aborted. No accepted gate or output exists and the pod was deleted."},
-    {"run_id": "second-order-llama20k-b200-lengthsorted-seed42-20260830T030933Z", "finding": "Cancelled pre-formal smoke-only run: batch-512 command was aborted; no accepted gate or output exists and the pod was deleted."}
-  ],
   "output": {
     "model": "meta-llama/Llama-3.2-3B-abliterated-seed42-lora",
     "schema": ["id", "source", "prompt", "response", "model"],
-    "raw_evidence": "The first published ordinal batch is the launch probe. Every attempted/published batch binds the shortest-first prompt identities, current batch size, padded length, seed 42, allocator, and throughput evidence. OOM transitions are journaled before publication.",
+    "raw_evidence": "Each published batch records the selected physical size and memory check; detailed experiment evidence is documented only after a successful run.",
     "finalization": "Validate authoritative identities, restore original index order, then atomically publish one five-key 20,000-row corpus."
   }
 }

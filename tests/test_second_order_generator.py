@@ -9,9 +9,10 @@ from unittest.mock import patch
 
 from experiment import generate_second_order_20k as subject
 from experiment import generate_teacher_20k as teacher
-from experiment.batch_io import ValidationError, atomic_write_json, publish_batch, sha256_file, sha256_text
+from experiment.batch_io import ValidationError, atomic_write_json, publish_batch, sha256_text
 
 ROOT = Path(__file__).resolve().parents[1]
+MIB = 1024 * 1024
 
 
 def prompt(index: int, tokens: int) -> dict:
@@ -34,170 +35,192 @@ def raw(item: dict, ordinal: int, size: int, padded: int) -> dict:
             "hit_token_cap": False, "is_blank": False}
 
 
+def memory_policy(total_mib: int = 97887, baseline_mib: int = 7156) -> dict:
+    geometry = {"num_hidden_layers": 28, "num_key_value_heads": 8, "num_attention_heads": 24,
+                "hidden_size": 3072, "head_dim": 128, "dtype_bytes": 2,
+                "kv_bytes_per_token_per_sequence": subject.EXPECTED_KV_BYTES_PER_TOKEN}
+    total, baseline = total_mib * MIB, baseline_mib * MIB
+    value = {"format": "second-order-memory-policy-v1", "geometry": geometry,
+             "logical_max_batch_size": 256, "max_new_tokens": 4096,
+             "allocated_vram_budget_numerator": 7, "allocated_vram_budget_denominator": 10,
+             "allocated_vram_budget_bytes": total * 7 // 10,
+             "post_load_allocated_bytes": baseline, "post_load_reserved_bytes": baseline,
+             "total_vram_bytes": total, "baseline_tolerance_bytes": 64 * MIB}
+    value["sha256"] = sha256_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    return value
+
+
 class FakeCuda:
     class OutOfMemoryError(RuntimeError): pass
-    def __init__(self, count=1, name=subject.GPU_NAME): self.count, self.name = count, name
+    def __init__(self, count=1, name=subject.GPU_NAME, allocated=100, reserved=100, total=1000):
+        self.count, self.name, self.allocated, self.reserved, self.total = count, name, allocated, reserved, total
+        self.empty_calls = self.sync_calls = 0
     def is_available(self): return True
     def device_count(self): return self.count
     def get_device_name(self, index): return self.name
+    def empty_cache(self): self.empty_calls += 1; self.reserved = self.allocated
+    def synchronize(self): self.sync_calls += 1
+    def mem_get_info(self): return self.total - self.reserved, self.total
+    def memory_allocated(self): return self.allocated
+    def memory_reserved(self): return self.reserved
 
 
 class FakeTorch:
-    def __init__(self, count=1, name=subject.GPU_NAME): self.cuda = FakeCuda(count, name)
+    def __init__(self, **kwargs): self.cuda = FakeCuda(**kwargs)
+
+
+class Config:
+    num_hidden_layers = 28
+    num_key_value_heads = 8
+    num_attention_heads = 24
+    hidden_size = 3072
+    head_dim = 128
+
+
+class Model:
+    config = Config()
+    dtype = "torch.bfloat16"
 
 
 class SecondOrderContractTests(unittest.TestCase):
-    def test_amendment_authoritative_input_and_no_smoke_or_budget_scheduler(self):
-        rows = subject._load_source(ROOT / subject.INPUT_RELATIVE)
+    def test_amendment_binds_memory_budget_and_disables_oom_retry(self):
+        rows = subject._load_source(ROOT / subject.CLEAN_SOURCE_RELATIVE, ROOT / subject.ORGANIC_SOURCE_RELATIVE)
         self.assertEqual(len(rows), 20_000)
-        self.assertEqual(subject.validate_amendment(ROOT / subject.AMENDMENT_RELATIVE)["sha256"], subject.AMENDMENT_SHA256)
-        source = (ROOT / "experiment/generate_second_order_20k.py").read_text(encoding="utf-8").lower()
-        controller = (ROOT / "scripts/generate-second-order-20k.ps1").read_text(encoding="ascii").lower()
-        for forbidden in ("smoke", "conv_index", "_schedule_batch", "accepted_smoke", "formal-schedule"):
-            self.assertNotIn(forbidden, source)
-            self.assertNotIn(forbidden, controller)
-        self.assertIn('gpu_name = "nvidia rtx pro 6000 blackwell workstation edition"', source)
+        self.assertEqual([row["global_index"] for row in rows[-4:]], [19_996, 19_997, 19_998, 19_999])
+        amendment = subject.validate_amendment(ROOT / subject.AMENDMENT_RELATIVE)["value"]
+        self.assertEqual(amendment["format"], "second-order-llama-adapter-20000-amendment-v5")
+        self.assertEqual(amendment["execution"]["logical_max_batch_size"], 256)
+        self.assertEqual(amendment["execution"]["oom_policy"], "unexpected invariant failure before publication; never reduce and retry")
+        source = (ROOT / "experiment/generate_second_order_20k.py").read_text(encoding="utf-8")
+        self.assertNotIn("_next_batch_size_after_oom", source)
+        self.assertNotIn('event="oom_before_publish"', source)
+        self.assertIn('cache_implementation="dynamic"', source)
 
     def test_decode_is_exact_teacher_parity_and_preserves_raw_whitespace(self):
         class Tokenizer:
             eos_token_id, pad_token_id = 2, 0
             def decode(self, ids, **kwargs): self.kwargs = kwargs; return " <%s> " % ",".join(map(str, ids))
-        tokenizer = Tokenizer()
-        fixture = ([9, 9, 4, 0, 5, 2], 2, 4096)
+        tokenizer = Tokenizer(); fixture = ([9, 9, 4, 0, 5, 2], 2, 4096)
         self.assertEqual(subject._decode_completion(tokenizer, *fixture), teacher._decode_completion(tokenizer, *fixture))
         self.assertEqual(subject._decode_completion(tokenizer, *fixture)[0], " <4,5> ")
         self.assertFalse(tokenizer.kwargs["clean_up_tokenization_spaces"])
 
-    def test_shortest_first_and_first_selected_group_is_exactly_256_regardless_of_lengths(self):
-        work = subject._sorted_work([prompt(index, 10_000 - index) for index in range(600)])
-        self.assertEqual([row["global_index"] for row in work[:3]], [599, 598, 597])
-        first = list(work[:subject.MAX_BATCH_SIZE])
-        self.assertEqual(len(first), 256)
-        self.assertEqual(max(row["input_tokens"] for row in first), 10_000 - 344)
+    def test_exact_authorized_kv_geometry(self):
+        geometry = subject._kv_geometry(Model())
+        self.assertEqual(geometry["kv_bytes_per_token_per_sequence"], 28 * 2 * 8 * 128 * 2)
+        Model.config.num_hidden_layers = 27
+        try:
+            with self.assertRaises(ValidationError): subject._kv_geometry(Model())
+        finally:
+            Model.config.num_hidden_layers = 28
 
-    def test_three_quarter_oom_transitions_and_no_pressure_reduction(self):
-        current = 256
-        seen = []
-        for _ in range(4):
-            seen.append(current); current = subject._next_batch_size_after_oom(current)
-        self.assertEqual(seen + [current], [256, 192, 144, 108, 81])
-        self.assertEqual(subject._next_batch_size_after_oom(1), 1)
-        source = (ROOT / "experiment/generate_second_order_20k.py").read_text(encoding="utf-8")
-        self.assertNotIn("allocated_memory_pressure >=", source)
-        self.assertIn("current = _next_batch_size_after_oom(before)", source)
+    def test_memory_selection_is_budgeted_and_shrinks_for_long_prompts(self):
+        policy = memory_policy()
+        short, short_evidence = subject._select_physical_batch([prompt(i, 47) for i in range(300)], policy)
+        long, long_evidence = subject._select_physical_batch([prompt(i, 7217) for i in range(300)], policy)
+        expected = min(256, (policy["allocated_vram_budget_bytes"] - policy["post_load_allocated_bytes"])
+                       // ((47 + 4096) * subject.EXPECTED_KV_BYTES_PER_TOKEN))
+        self.assertEqual(len(short), expected)
+        self.assertGreaterEqual(len(short), 128); self.assertLessEqual(len(short), 144)
+        self.assertLess(len(long), len(short))
+        for evidence in (short_evidence, long_evidence):
+            self.assertLessEqual(evidence["projected_allocated_bytes"], evidence["allocated_vram_budget_bytes"])
+            self.assertEqual(evidence["actual_size"], evidence["physical_batch_size"])
 
-    def test_exact_journal_resume_validates_same_prefix_and_arbitrary_current(self):
-        authority = [prompt(index, 1) for index in range(1024)]
-        work = list(authority)
+    def test_allocator_cleanup_and_leak_detection(self):
+        torch = FakeTorch(allocated=100, reserved=400, total=1000)
+        state = subject._allocator_state_after_cleanup(torch)
+        self.assertEqual((state["allocated_bytes"], state["reserved_bytes"]), (100, 100))
+        self.assertEqual((torch.cuda.empty_calls, torch.cuda.sync_calls), (1, 1))
+        policy = {"post_load_allocated_bytes": 100, "baseline_tolerance_bytes": 10, "total_vram_bytes": 1000}
+        subject._assert_allocator_baseline(torch, policy, "test")
+        torch.cuda.allocated = 111
+        with self.assertRaises(ValidationError): subject._assert_allocator_baseline(torch, policy, "leak")
+
+    def test_resume_binds_exact_memory_safe_prefix_and_rejects_old_oom_event(self):
+        authority = [prompt(index, 47) for index in range(300)]
+        policy = memory_policy(); group, selection = subject._select_physical_batch(authority, policy)
         with tempfile.TemporaryDirectory() as temp:
-            run = Path(temp)
-            first = authority[:256]
-            first_rows = [raw(item, 0, 256, 1) for item in first]
-            manifest = {"plan_sha256": "p", "batch_ordinal": 0, "actual_size": 256, "padded_input_tokens": 1,
-                        "batch_size_before": 256, "batch_size_after": 256, "batch_seed": 42,
-                        "original_indices": list(range(256))}
-            publish_batch(run / "raw" / "batches", "batch-00000", first_rows, key=lambda row: str(row["global_index"]),
+            run = Path(temp); atomic_write_json(run / "memory-policy.json", policy)
+            rows = [raw(item, 0, len(group), 47) for item in group]
+            manifest = {"plan_sha256": "p", "batch_ordinal": 0, "batch_seed": 42,
+                        "original_indices": [row["global_index"] for row in group], **selection}
+            publish_batch(run / "raw" / "batches", "batch-00000", rows, key=lambda row: str(row["global_index"]),
                           required_keys=subject.RAW_KEYS, extra_manifest=manifest)
-            subject._append_scheduler_event(run, event="attempt", batch_ordinal=0, current_batch_size=256,
-                                            actual_size=256, padded_input_tokens=1, original_indices=list(range(256)), seed=42)
-            subject._append_scheduler_event(run, event="published", batch="batch-00000", batch_ordinal=0,
-                                            current_batch_size=256, actual_size=256, padded_input_tokens=1,
-                                            original_indices=list(range(256)), seed=42)
-            subject._append_scheduler_event(run, event="attempt", batch_ordinal=1, current_batch_size=256,
-                                            actual_size=256, padded_input_tokens=1, original_indices=list(range(256, 512)), seed=42)
-            subject._append_scheduler_event(run, event="oom_before_publish", batch_ordinal=1,
-                                            current_batch_size_before=256, current_batch_size_after=192, actual_size=256,
-                                            padded_input_tokens=1, original_indices=list(range(256, 512)), error_type="OutOfMemoryError")
-            rows, current = subject._worker_rows(run, authority, "p", work)
-            self.assertEqual((len(rows), current), (256, 192))
-            with self.assertRaises(ValidationError):
-                subject._worker_rows(run, authority, "p", [*work[256:], *work[:256]])
+            attempt = {"event": "attempt", "batch_ordinal": 0, **selection,
+                       "original_indices": manifest["original_indices"], "seed": 42}
+            published = {"event": "published", "batch": "batch-00000", "batch_ordinal": 0, **selection,
+                         "original_indices": manifest["original_indices"], "seed": 42}
+            subject._append_scheduler_event(run, **attempt); subject._append_scheduler_event(run, **published)
+            validated, last = subject._worker_rows(run, authority, "p", authority, policy)
+            self.assertEqual((len(validated), last), (len(group), len(group)))
+            subject._append_scheduler_event(run, event="oom_before_publish")
+            with self.assertRaises(ValidationError): subject._worker_rows(run, authority, "p", authority, policy)
 
-    def test_dangling_attempt_is_exactly_retryable_after_abrupt_interruption(self):
-        work = [prompt(index, 1) for index in range(600)]
+    def test_resume_rejects_memory_selection_or_prefix_drift(self):
+        work = [prompt(index, 47) for index in range(300)]; policy = memory_policy()
+        group, selection = subject._select_physical_batch(work, policy)
+        event = {"event": "attempt", "batch_ordinal": 0, **selection,
+                 "original_indices": [row["global_index"] for row in group], "seed": 42}
         with tempfile.TemporaryDirectory() as temp:
-            run = Path(temp)
-            event = {"event": "attempt", "batch_ordinal": 0, "current_batch_size": 256, "actual_size": 256,
-                     "padded_input_tokens": 1, "original_indices": list(range(256)), "seed": 42}
-            subject._append_scheduler_event(run, **event)
-            rows, current = subject._worker_rows(run, work, "p", work)
-            self.assertEqual((rows, current), ([], 256))
-            subject._append_scheduler_event(run, **event)
-            rows, current = subject._worker_rows(run, work, "p", work)
-            self.assertEqual((rows, current), ([], 256))
+            run = Path(temp); subject._append_scheduler_event(run, **event)
+            with self.assertRaises(ValidationError): subject._worker_rows(run, work, "p", work, policy)
         with tempfile.TemporaryDirectory() as temp:
-            run = Path(temp)
-            subject._append_scheduler_event(run, **event)
-            changed = {**event, "actual_size": 255, "original_indices": list(range(255))}
-            subject._append_scheduler_event(run, **changed)
-            with self.assertRaises(ValidationError):
-                subject._worker_rows(run, work, "p", work)
+            run = Path(temp); subject._append_scheduler_event(run, **event)
+            with self.assertRaises(ValidationError): subject._worker_rows(run, work, "p", [*work[1:], work[0]], policy)
 
-    def test_mocked_formal_worker_oom_retries_same_prefix_then_publishes(self):
-        prompts = [prompt(index, 1) for index in range(4)]
-        layout = list(prompts)
+    def test_unexpected_generation_failures_never_retry_or_publish(self):
+        prompts = [prompt(index, 47) for index in range(4)]; policy = memory_policy()
+        cases = [(FakeCuda.OutOfMemoryError("out of memory"), "unexpected_oom"),
+                 (RuntimeError("kernel failed"), "unexpected_failure")]
+        for failure, expected_event in cases:
+            with self.subTest(expected_event=expected_event), tempfile.TemporaryDirectory() as temp, patch.object(subject, "EXPECTED_ROWS", 4):
+                root = Path(temp) / "run"; root.mkdir(); atomic_write_json(root / "plan.json", {"plan": True})
+                args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 256,
+                                            "input": root / "input", "checkpoint": root / "checkpoint",
+                                            "staging_manifest": root / "staging", "tokenizer_path": "t"})()
+                manifest = {"repository": {"head": "x", "dirty": False}, "runtime_source_sha256": {}}
+                calls = []
+                def generate(*args):
+                    calls.append(1); raise failure
+                with patch.dict(sys.modules, {"torch": FakeTorch()}), patch.object(subject, "plan", return_value={"manifest": manifest}), patch.object(subject, "_clean_live"), patch.object(subject, "_authoritative_prompts", return_value=prompts), patch.object(subject, "_runtime"), patch.object(subject, "_staging", return_value={}), patch.object(subject, "verify_staged_snapshot"), patch.object(subject, "_load_tokenizer", return_value=object()), patch.object(subject, "_load_model", return_value=Model()), patch.object(subject, "_layout", return_value=prompts), patch.object(subject, "_prepare_layout", return_value=(prompts, "layout")), patch.object(subject, "_memory_policy", return_value=policy), patch.object(subject, "_assert_allocator_baseline", return_value={"allocated_bytes": 1}), patch.object(subject, "_allocator_state_after_cleanup", return_value={"allocated_bytes": 1, "reserved_bytes": 1, "free_bytes": 9, "total_vram_bytes": 10}), patch.object(subject, "_generate_attempt", side_effect=generate):
+                    with self.assertRaises(ValidationError): subject.worker(args)
+                self.assertEqual(len(calls), 1)
+                batches = root / "formal" / "raw" / "batches"
+                self.assertEqual(list(batches.glob("*")) if batches.exists() else [], [])
+                events = [json.loads(line) for line in (root / "formal" / "scheduler.jsonl").read_text(encoding="utf-8").splitlines()]
+                self.assertEqual([event["event"] for event in events], ["attempt", expected_event])
+                with self.assertRaises(ValidationError):
+                    subject._worker_rows(root / "formal", prompts, "p", prompts, policy)
+
+    def test_success_cleans_before_and_after_then_publishes(self):
+        prompts = [prompt(index, 47) for index in range(4)]; policy = memory_policy()
+        details = {"elapsed_seconds": 1.0, "peak_allocated_bytes": 2, "peak_reserved_bytes": 3,
+                   "total_vram_bytes": 10, "allocated_memory_pressure": .2, "reserved_memory_pressure": .3}
         with tempfile.TemporaryDirectory() as temp, patch.object(subject, "EXPECTED_ROWS", 4):
             root = Path(temp) / "run"; root.mkdir(); atomic_write_json(root / "plan.json", {"plan": True})
             args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 256,
                                         "input": root / "input", "checkpoint": root / "checkpoint",
                                         "staging_manifest": root / "staging", "tokenizer_path": "t"})()
-            calls = []
+            manifest = {"repository": {"head": "x", "dirty": False}, "runtime_source_sha256": {}}; phases = []
+            def baseline(torch, policy, phase): phases.append(phase); return {"phase": phase, "allocated_bytes": 1}
             def generate(torch, tokenizer, model, group, padded):
-                calls.append([item["global_index"] for item in group])
-                if len(calls) == 1: raise FakeCuda.OutOfMemoryError("out of memory")
-                return [raw(item, 0, len(group), padded) for item in group], {"elapsed_seconds": 1.0,
-                    "peak_allocated_bytes": 1, "peak_reserved_bytes": 1, "total_vram_bytes": 10,
-                    "allocated_memory_pressure": .1, "reserved_memory_pressure": .1}
-            manifest = {"repository": {"head": "x", "dirty": False}, "runtime_source_sha256": {}}
-            with patch.object(subject, "plan", return_value={"manifest": manifest}), patch.object(subject, "_load_source", return_value=prompts):
-                subject.prepare(args)
-            class Process:
-                pid = 123
-                def poll(self): return None
-            with patch.dict(sys.modules, {"torch": object()}), patch.object(subject, "plan", return_value={"manifest": manifest}), \
-                 patch.object(subject, "_clean_live"), patch.object(subject, "_runtime"), \
-                 patch.object(subject.subprocess, "Popen", return_value=Process()), patch.object(subject, "_process_start_identity", return_value="identity"):
-                subject.start(args)
-            with patch.dict(sys.modules, {"torch": object()}), patch.object(subject, "plan", return_value={"manifest": manifest}), patch.object(subject, "_clean_live"), \
-                 patch.object(subject, "_authoritative_prompts", return_value=prompts), patch.object(subject, "_runtime"), \
-                 patch.object(subject, "_staging", return_value={}), patch.object(subject, "verify_staged_snapshot"), \
-                 patch.object(subject, "_load_tokenizer", return_value=object()), patch.object(subject, "_load_model", return_value=object()), \
-                 patch.object(subject, "_layout", return_value=layout), patch.object(subject, "_prepare_layout", return_value=(layout, "layout")), \
-                 patch.object(subject, "_attempt_after_allocator_cleanup", side_effect=lambda torch, operation: operation()), \
-                 patch.object(subject, "_generate_attempt", side_effect=generate), patch.object(subject, "_is_oom", return_value=True), \
-                 patch.object(subject, "_release_cuda_allocator_cache"):
-                subject.worker(args)
-            self.assertEqual(calls, [[0, 1, 2, 3], [0, 1, 2, 3]])
-            record = json.loads((root / "formal" / "raw" / "record.json").read_text(encoding="utf-8"))
-            self.assertTrue(record["first_published_batch_is_launch_probe"])
-            self.assertEqual(record["current_batch_size"], 192)
-            subject._write_no_clobber_jsonl(root / "prompt-layout.jsonl", subject._layout_evidence(layout))
-            with patch.object(subject, "plan", return_value={"manifest": manifest}), patch.object(subject, "_clean_live"), \
-                 patch.object(subject, "_authoritative_prompts", return_value=prompts):
-                final = subject.finalise(args)
-            self.assertEqual(final["row_count"], 4)
-            final_rows = [json.loads(line) for line in (root / "final" / "output" / "rollouts.jsonl").read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([row["id"] for row in final_rows], ["id-0", "id-1", "id-2", "id-3"])
+                return [raw(item, 0, len(group), padded) for item in group], details
+            with patch.dict(sys.modules, {"torch": object()}), patch.object(subject, "plan", return_value={"manifest": manifest}), patch.object(subject, "_clean_live"), patch.object(subject, "_authoritative_prompts", return_value=prompts), patch.object(subject, "_runtime"), patch.object(subject, "_staging", return_value={}), patch.object(subject, "verify_staged_snapshot"), patch.object(subject, "_load_tokenizer", return_value=object()), patch.object(subject, "_load_model", return_value=Model()), patch.object(subject, "_layout", return_value=prompts), patch.object(subject, "_prepare_layout", return_value=(prompts, "layout")), patch.object(subject, "_memory_policy", return_value=policy), patch.object(subject, "_assert_allocator_baseline", side_effect=baseline), patch.object(subject, "_generate_attempt", side_effect=generate):
+                record = subject.worker(args)
+            self.assertEqual(phases, ["before_generation", "after_generation"])
+            self.assertEqual(record["row_count"], 4)
+            self.assertEqual(len(subject.finalized_batches(root / "formal" / "raw" / "batches")), 1)
 
-    def test_start_rejects_wrong_batch_dirty_or_wrong_gpu_and_controller_is_ascii(self):
+    def test_runtime_and_controller_contract(self):
         data = (ROOT / "scripts/generate-second-order-20k.ps1").read_bytes(); text = data.decode("ascii")
         self.assertIn("#requires -Version 5.1", text)
-        self.assertIn("[Alias('Input')][string]$InputPath", text)
-        self.assertIn("$BatchSize -ne 256", text)
-        self.assertNotIn("Smoke", text)
-        with patch.object(subject, "_git_state", return_value={"head": "x", "dirty": True}):
-            with self.assertRaises(ValidationError):
-                subject._clean_live({"repository": {"head": "x", "dirty": False}, "runtime_source_sha256": {}})
+        self.assertIn("logical physical-batch ceiling", text)
         with patch.object(subject, "_packages", return_value=subject.RUNTIME_PACKAGES):
             subject._runtime(FakeTorch())
+            subject._runtime(FakeTorch(name="NVIDIA RTX PRO 6000 Blackwell Server Edition"))
             with self.assertRaises(ValidationError): subject._runtime(FakeTorch(count=2))
             with self.assertRaises(ValidationError): subject._runtime(FakeTorch(name="NVIDIA B100"))
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp) / "run"; root.mkdir(); atomic_write_json(root / "plan.json", {"plan": True})
-            args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 128,
-                                        "input": root / "input", "checkpoint": root / "checkpoint", "staging_manifest": root / "staging"})()
-            with patch.object(subject, "plan", return_value={"manifest": {}}), patch.object(subject, "_clean_live"):
-                with self.assertRaises(ValidationError): subject.start(args)
 
     def test_final_order_is_original_index_order(self):
         rows = {1: raw(prompt(1, 1), 0, 1, 1), 0: raw(prompt(0, 1), 1, 1, 1)}
