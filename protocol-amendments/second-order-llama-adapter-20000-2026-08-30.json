@@ -36,10 +36,12 @@
   },
   "execution": {
     "gpu_names": ["NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "NVIDIA RTX PRO 6000 Blackwell Server Edition"], "visible_cuda_gpus": 1, "model_processes": 1, "tensor_parallel": false,
-    "logical_max_batch_size": 96, "allocated_vram_budget_numerator": 13, "allocated_vram_budget_denominator": 20,
-    "reserved_headroom_fraction": 0.35, "allocator_baseline_tolerance_bytes": 67108864,
-    "physical_batch_selection": "largest shortest-first pending prefix at or below 96 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 65% total-VRAM ceiling",
+    "logical_max_batch_size": 128, "allocated_vram_budget_numerator": 3, "allocated_vram_budget_denominator": 4,
+    "reserved_headroom_fraction": 0.25, "allocator_baseline_tolerance_bytes": 67108864,
+    "physical_batch_selection": "largest shortest-first pending prefix at or below 128 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 75% total-VRAM ceiling",
     "cuda_allocator_conf": "expandable_segments:True",
+    "continuation_parent_batch_size": 96,
+    "continuation_policy": "preserve the exact finalized parent prefix, abandon at most one unpublished trailing parent attempt, and generate only remaining prompts",
     "oom_policy": "unexpected invariant failure before publication; never reduce and retry",
     "allocator_policy": "outside any exception handler, gc.collect, empty_cache, synchronize, then require allocated bytes to return within 64 MiB of the post-load baseline before and after every generation call"
   },

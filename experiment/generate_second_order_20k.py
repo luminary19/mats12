@@ -49,7 +49,7 @@ ORGANIC_TEXT_SHA256 = "5fcd4b4037181b0a497f104b7c8fd53a7c39ba74d30768176222a6ce2
 ORGANIC_ROWS = 4
 CHECKPOINT_RELATIVE = evaluation.CHECKPOINT_RELATIVE
 AMENDMENT_RELATIVE = "protocol-amendments/second-order-llama-adapter-20000-2026-08-30.json"
-AMENDMENT_SHA256 = "a6a53d65074979869a15a742fc5f26bc8b419112d6e7796efe06f1cdd13bdc6d"
+AMENDMENT_SHA256 = "8276e388db18ce0475ad8943b572597106a3a133733dc8d57c4a36896aa13d29"
 STAGING_MANIFEST_SHA256 = evaluation.STAGING_MANIFEST_SHA256
 REQUIREMENTS_SHA256 = "b43bdda703da408acb33faf82f73385b0bf8528225422cfe7dc6cbedc04b2590"
 TEACHER_GENERATOR_SHA256 = "20334a6d1f3c3140f6ea359eb33f49f2e55a218067d2b26f8553f765ae199811"
@@ -64,7 +64,8 @@ RAW_KEYS = ("global_index", "id", "source", "prompt", "prompt_sha256", "response
 EXPECTED_ROWS = 20_000
 MASTER_SEED = 42
 MAX_NEW_TOKENS = 4096
-MAX_BATCH_SIZE = 96  # User-selected HF microbatch ceiling.
+MAX_BATCH_SIZE = 128  # User-selected continuation batch ceiling.
+PARENT_BATCH_SIZE = 96
 GPU_NAMES = ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
              "NVIDIA RTX PRO 6000 Blackwell Server Edition")
 GPU_NAME = GPU_NAMES[0]  # Backward-compatible default for controller/tests; runtime accepts either exact name.
@@ -72,8 +73,8 @@ MODEL_LABEL = "meta-llama/Llama-3.2-3B-abliterated-seed42-lora"
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 RUNTIME_PACKAGES = {"torch": "2.8.0+cu128", "transformers": "5.16.1", "peft": "0.18.1", "accelerate": "1.10.1", "safetensors": "0.8.0"}
 CUDA_ALLOCATOR_CONF = "expandable_segments:True"
-VRAM_BUDGET_NUMERATOR = 13
-VRAM_BUDGET_DENOMINATOR = 20
+VRAM_BUDGET_NUMERATOR = 3
+VRAM_BUDGET_DENOMINATOR = 4
 ALLOCATOR_BASELINE_TOLERANCE_BYTES = 64 * 1024 * 1024
 EXPECTED_LAYERS = 28
 EXPECTED_KV_HEADS = 8
@@ -163,10 +164,12 @@ def validate_amendment(path: Path) -> dict[str, Any]:
                           "tensor_parallel": False, "logical_max_batch_size": MAX_BATCH_SIZE,
                           "allocated_vram_budget_numerator": VRAM_BUDGET_NUMERATOR,
                           "allocated_vram_budget_denominator": VRAM_BUDGET_DENOMINATOR,
-                          "reserved_headroom_fraction": 0.35,
+                          "reserved_headroom_fraction": 0.25,
                           "allocator_baseline_tolerance_bytes": ALLOCATOR_BASELINE_TOLERANCE_BYTES,
-                          "physical_batch_selection": "largest shortest-first pending prefix at or below 96 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 65% total-VRAM ceiling",
+                          "physical_batch_selection": "largest shortest-first pending prefix at or below 128 whose exact BF16 worst-case KV bytes for padded_input_tokens plus 4096 fit beside the post-load allocation under the 75% total-VRAM ceiling",
                           "cuda_allocator_conf": CUDA_ALLOCATOR_CONF,
+                          "continuation_parent_batch_size": PARENT_BATCH_SIZE,
+                          "continuation_policy": "preserve the exact finalized parent prefix, abandon at most one unpublished trailing parent attempt, and generate only remaining prompts",
                           "oom_policy": "unexpected invariant failure before publication; never reduce and retry",
                           "allocator_policy": "outside any exception handler, gc.collect, empty_cache, synchronize, then require allocated bytes to return within 64 MiB of the post-load baseline before and after every generation call"}
     source = value.get("input", {})
@@ -224,6 +227,7 @@ def _runtime_sources() -> dict[str, str]:
 
 def _plan_manifest(args: argparse.Namespace, prompts: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     amendment = validate_amendment(Path(args.amendment))
+    _, continuation = _continuation_parent(args, prompts)
     checkpoint, staging = evaluation.validate_checkpoint(Path(args.checkpoint)), _staging(Path(args.staging_manifest))
     if args.base_path != staging["model"]["local_dir"] or args.tokenizer_path != staging["tokenizer"]["local_dir"]:
         raise ValidationError("runtime model/tokenizer paths must equal staged paths")
@@ -241,6 +245,7 @@ def _plan_manifest(args: argparse.Namespace, prompts: Sequence[Mapping[str, Any]
                           "date_string": evaluation.FROZEN_DATE, "template": "apply_chat_template-user-only", "legacy_extra_bos": True},
             "scheduler_provenance": amendment["value"]["scheduler_provenance"], "staging_manifest_sha256": STAGING_MANIFEST_SHA256,
             "requirements_sha256": REQUIREMENTS_SHA256, "repository": _git_state(), "runtime_source_sha256": _runtime_sources(),
+            "continuation": continuation,
             "generation": {"master_seed": MASTER_SEED, "batch_seed": "42 reset for every physical batch",
                            "batch_layout_note": "deterministic only for recorded physical batch layouts; not row-level independent",
                            "do_sample": True, "temperature": 1.0, "top_p": 1.0, "top_k": 0, "max_new_tokens": MAX_NEW_TOKENS,
@@ -257,6 +262,7 @@ def _plan_manifest(args: argparse.Namespace, prompts: Sequence[Mapping[str, Any]
 def plan(args: argparse.Namespace) -> dict[str, Any]:
     protected = [Path(args.clean_source), Path(args.organic_source), Path(args.checkpoint),
                  Path(args.staging_manifest), Path(args.amendment), Path(args.requirements)]
+    if getattr(args, "parent_run", None) is not None: protected.append(Path(args.parent_run))
     _safe_run_root(Path(args.run_root), Path(args.runs_root), protected)
     if sha256_file(Path(args.requirements)) != REQUIREMENTS_SHA256:
         raise ValidationError("pinned evaluation requirements checksum differs")
@@ -265,7 +271,8 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
     existing = Path(args.run_root) / "plan.json"
     if existing.exists() and _json(existing) != manifest:
         raise ValidationError("second-order plan is immutable")
-    return {"manifest": manifest, "row_count": len(prompts)}
+    return {"manifest": manifest, "row_count": len(prompts),
+            "parent_row_count": (manifest.get("continuation") or {}).get("row_count", 0)}
 
 
 def _fsync_directory(path: Path) -> None:
@@ -467,8 +474,9 @@ def _assert_allocator_baseline(torch: Any, policy: Mapping[str, Any], phase: str
     return {"phase": phase, **state, "allocated_drift_bytes": drift}
 
 
-def _select_physical_batch(pending: Sequence[Mapping[str, Any]], policy: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    ceiling = min(MAX_BATCH_SIZE, len(pending))
+def _select_physical_batch(pending: Sequence[Mapping[str, Any]], policy: Mapping[str, Any],
+                           max_batch_size: int = MAX_BATCH_SIZE) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ceiling = min(max_batch_size, len(pending))
     kv_per_token = policy["geometry"]["kv_bytes_per_token_per_sequence"]
     for size in range(ceiling, 0, -1):
         padded = max(row["input_tokens"] for row in pending[:size])
@@ -477,7 +485,7 @@ def _select_physical_batch(pending: Sequence[Mapping[str, Any]], policy: Mapping
         projected = policy["post_load_allocated_bytes"] + predicted_kv
         if projected <= policy["allocated_vram_budget_bytes"]:
             group = [dict(row) for row in pending[:size]]
-            evidence = {"memory_policy_sha256": policy["sha256"], "logical_max_batch_size": MAX_BATCH_SIZE,
+            evidence = {"memory_policy_sha256": policy["sha256"], "logical_max_batch_size": max_batch_size,
                         "physical_batch_size": size, "actual_size": size, "padded_input_tokens": padded,
                         "worst_case_total_tokens_per_sequence": worst_case_tokens,
                         "kv_bytes_per_token_per_sequence": kv_per_token, "predicted_kv_bytes": predicted_kv,
@@ -629,6 +637,80 @@ def _worker_rows(run: Path, prompts: Sequence[Mapping[str, Any]], plan_sha: str,
     return rows, last_size
 
 
+def _continuation_parent(args: argparse.Namespace, prompts: Sequence[Mapping[str, Any]],
+                         work: Sequence[Mapping[str, Any]] | None = None) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    value = getattr(args, "parent_run", None)
+    if value is None:
+        return [], None
+    parent = Path(value).resolve(strict=True); runs_root = Path(args.runs_root).resolve(strict=True)
+    if parent.parent != runs_root or parent == Path(args.run_root).resolve(strict=False):
+        raise ValidationError("continuation parent must be one distinct direct child of runs root")
+    parent_plan_path = parent / "plan.json"; parent_plan = _json(parent_plan_path); parent_plan_sha = sha256_file(parent_plan_path)
+    ordered = sha256_text(json.dumps(list(prompts), ensure_ascii=False, separators=(",", ":")))
+    if (parent_plan.get("format") != "second-order-llama-adapter-20k-v5"
+            or parent_plan.get("input", {}).get("ordered_prompt_set_sha256") != ordered
+            or parent_plan.get("input", {}).get("row_count") != EXPECTED_ROWS
+            or parent_plan.get("adapter", {}).get("checkpoint_manifest_sha256") != evaluation.CHECKPOINT_MANIFEST_SHA256
+            or parent_plan.get("generation", {}).get("max_new_tokens") != MAX_NEW_TOKENS
+            or parent_plan.get("generation", {}).get("cache_implementation") != "dynamic"
+            or parent_plan.get("batching", {}).get("logical_max_batch_size") != PARENT_BATCH_SIZE):
+        raise ValidationError("continuation parent plan semantics differ")
+    prepared = list(iter_jsonl(parent / "prompt-set" / "prompts.jsonl"))
+    if prepared != list(prompts):
+        raise ValidationError("continuation parent prompt set differs")
+    parent_layout = list(iter_jsonl(parent / "prompt-layout.jsonl"))
+    if len(parent_layout) != EXPECTED_ROWS:
+        raise ValidationError("continuation parent prompt layout coverage differs")
+    parent_work = _sorted_work(parent_layout)
+    if work is not None and _layout_evidence(work) != _layout_evidence(parent_work):
+        raise ValidationError("continuation parent rendering differs")
+    policy = _json(parent / "formal" / "memory-policy.json")
+    if policy.get("logical_max_batch_size") != PARENT_BATCH_SIZE:
+        raise ValidationError("continuation parent memory policy differs")
+    batches = finalized_batches(parent / "formal" / "raw" / "batches")
+    rows: list[dict[str, Any]] = []; manifests: list[dict[str, Any]] = []
+    for ordinal, batch in enumerate(batches):
+        if batch.name != "batch-%05d" % ordinal:
+            raise ValidationError("continuation parent batch names differ")
+        manifest, data = _json(batch / "manifest.json"), list(iter_jsonl(batch / "data.jsonl"))
+        if (manifest.get("plan_sha256") != parent_plan_sha or manifest.get("batch_ordinal") != ordinal
+                or manifest.get("actual_size") != len(data) or manifest.get("physical_batch_size") != len(data)
+                or manifest.get("logical_max_batch_size") != PARENT_BATCH_SIZE):
+            raise ValidationError("continuation parent batch evidence differs")
+        _validate_raw(data, prompts); rows.extend(data); manifests.append(manifest)
+    if [row["global_index"] for row in rows] != [row["global_index"] for row in parent_work[:len(rows)]]:
+        raise ValidationError("continuation parent rows are not the exact sorted prefix")
+    events = list(iter_jsonl(parent / "formal" / "scheduler.jsonl"))
+    selection_keys = ("memory_policy_sha256", "logical_max_batch_size", "physical_batch_size", "actual_size",
+                      "padded_input_tokens", "worst_case_total_tokens_per_sequence",
+                      "kv_bytes_per_token_per_sequence", "predicted_kv_bytes", "projected_allocated_bytes",
+                      "allocated_vram_budget_bytes", "post_load_allocated_bytes")
+    cursor = 0; offset = 0
+    for ordinal, manifest in enumerate(manifests):
+        group, selection = _select_physical_batch(parent_work[offset:], policy, PARENT_BATCH_SIZE)
+        attempt = {"event": "attempt", "batch_ordinal": ordinal, **selection,
+                   "original_indices": [row["global_index"] for row in group], "seed": MASTER_SEED}
+        published = {"event": "published", "batch": "batch-%05d" % ordinal, "batch_ordinal": ordinal,
+                     **{key: attempt[key] for key in selection_keys},
+                     "original_indices": attempt["original_indices"], "seed": MASTER_SEED}
+        if cursor + 1 >= len(events) or events[cursor] != attempt or events[cursor + 1] != published:
+            raise ValidationError("continuation parent scheduler differs")
+        offset += len(group); cursor += 2
+    abandoned = False
+    if cursor < len(events):
+        group, selection = _select_physical_batch(parent_work[offset:], policy, PARENT_BATCH_SIZE)
+        trailing = {"event": "attempt", "batch_ordinal": len(manifests), **selection,
+                    "original_indices": [row["global_index"] for row in group], "seed": MASTER_SEED}
+        if events[cursor:] != [trailing]:
+            raise ValidationError("continuation parent has more than one unpublished attempt")
+        abandoned = True
+    evidence = {"format": "second-order-parent-prefix-v1", "run_id": parent.name,
+                "plan_sha256": parent_plan_sha, "scheduler_sha256": sha256_file(parent / "formal" / "scheduler.jsonl"),
+                "memory_policy_sha256": policy.get("sha256"), "row_count": len(rows),
+                "batch_count": len(manifests), "abandoned_trailing_attempt": abandoned}
+    return rows, evidence
+
+
 def _clean_live(manifest: Mapping[str, Any]) -> None:
     if manifest.get("repository", {}).get("dirty") is not False or _git_state() != manifest.get("repository"):
         raise ValidationError("live execution requires the clean repository identity bound by plan")
@@ -638,7 +720,7 @@ def _clean_live(manifest: Mapping[str, Any]) -> None:
 
 def worker(args: argparse.Namespace) -> dict[str, Any]:
     if args.batch_size != MAX_BATCH_SIZE:
-        raise ValidationError("formal worker logical batch ceiling must be 96")
+        raise ValidationError("formal worker logical batch ceiling must be 128")
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
     run = _subrun(root, "formal"); assert_run_mutable(run)
@@ -649,20 +731,24 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
         tokenizer, model = _load_tokenizer(args.tokenizer_path), _load_model(args, torch)
         layout, layout_sha = _prepare_layout(root, _layout(tokenizer, prompts, model), plan_sha)
         work = _sorted_work(layout)
+        parent_rows, parent_evidence = _continuation_parent(args, prompts, work)
+        if parent_evidence != manifest.get("continuation"):
+            raise ValidationError("continuation parent changed after plan")
+        continuation_work = work[len(parent_rows):]
         memory_policy = _memory_policy(torch, model)
         policy_path = run / "memory-policy.json"
         if policy_path.exists() and _json(policy_path) != memory_policy:
             raise ValidationError("runtime memory policy differs from immutable first execution")
         if not policy_path.exists(): atomic_write_json(policy_path, memory_policy)
-        worker_manifest = {"format": "second-order-worker-record-v6", "plan_sha256": plan_sha,
+        worker_manifest = {"format": "second-order-worker-record-v7", "plan_sha256": plan_sha,
                            "prompt_layout_sha256": layout_sha, "memory_policy_sha256": memory_policy["sha256"],
-                           "logical_max_batch_size": MAX_BATCH_SIZE, "oom_policy": "fail_closed_without_retry",
-                           "first_published_batch_is_launch_probe": True}
+                           "continuation": parent_evidence, "logical_max_batch_size": MAX_BATCH_SIZE,
+                           "oom_policy": "fail_closed_without_retry", "first_published_batch_is_launch_probe": True}
         if (run / "manifest.json").exists() and _json(run / "manifest.json") != worker_manifest:
             raise ValidationError("formal worker manifest binding differs")
         if not (run / "manifest.json").exists(): atomic_write_json(run / "manifest.json", worker_manifest)
-        existing, last_size = _worker_rows(run, prompts, plan_sha, work, memory_policy)
-        pending, ordinal = work[len(existing):], len(finalized_batches(run / "raw" / "batches"))
+        existing, last_size = _worker_rows(run, prompts, plan_sha, continuation_work, memory_policy)
+        pending, ordinal = continuation_work[len(existing):], len(finalized_batches(run / "raw" / "batches"))
         while pending:
             group, selection = _select_physical_batch(pending, memory_policy)
             allocator_before = _assert_allocator_baseline(torch, memory_policy, "before_generation")
@@ -702,14 +788,16 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
                                    logical_max_batch_size=MAX_BATCH_SIZE, actual_size=len(raw),
                                    launch_probe=(ordinal == 0), sha256=sha256_file(final / "data.jsonl"), **details)
             pending, ordinal, last_size = pending[len(group):], ordinal + 1, len(group)
-        rows, reconstructed_last = _worker_rows(run, prompts, plan_sha, work, memory_policy)
-        if len(rows) != EXPECTED_ROWS or reconstructed_last != last_size:
-            raise ValidationError("formal coverage or physical batch reconstruction incomplete")
-        record = {"format": "second-order-worker-record-v6", "plan_sha256": plan_sha, "row_count": len(rows),
+        rows, reconstructed_last = _worker_rows(run, prompts, plan_sha, continuation_work, memory_policy)
+        combined = [*parent_rows, *rows]
+        if len(combined) != EXPECTED_ROWS or reconstructed_last != last_size:
+            raise ValidationError("formal continuation coverage or physical batch reconstruction incomplete")
+        record = {"format": "second-order-worker-record-v7", "plan_sha256": plan_sha, "row_count": len(combined),
+                  "parent_row_count": len(parent_rows), "continuation_row_count": len(rows),
                   "memory_policy_sha256": memory_policy["sha256"], "last_physical_batch_size": last_size,
-                  "raw_sha256": sha256_text(json.dumps(rows, ensure_ascii=False, separators=(",", ":"))),
-                  "blank_count": sum(row["is_blank"] for row in rows),
-                  "termination_counts": dict(Counter(row["termination"] for row in rows)),
+                  "raw_sha256": sha256_text(json.dumps(combined, ensure_ascii=False, separators=(",", ":"))),
+                  "blank_count": sum(row["is_blank"] for row in combined),
+                  "termination_counts": dict(Counter(row["termination"] for row in combined)),
                   "first_published_batch_is_launch_probe": True}
         atomic_write_json(run / "raw" / "record.json", record); mark_done(run, {"status": "DONE", **record})
         return record
@@ -724,6 +812,7 @@ def supervise(args: argparse.Namespace) -> dict[str, Any]:
     root, launch = Path(args.run_root), _subrun(Path(args.run_root), "launch")
     _json(launch / "intent.json"); log = launch / "worker.log"
     command = [sys.executable, "-m", "experiment.generate_second_order_20k", "--worker", "--run-root", str(root), "--runs-root", str(args.runs_root), "--clean-source", str(args.clean_source), "--organic-source", str(args.organic_source), "--checkpoint", str(args.checkpoint), "--staging-manifest", str(args.staging_manifest), "--batch-size", str(args.batch_size)]
+    if getattr(args, "parent_run", None) is not None: command.extend(["--parent-run", str(args.parent_run)])
     with log.open("ab") as handle:
         child = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT)
         start = {"format": "second-order-supervisor-v3", "intent_sha256": sha256_file(launch / "intent.json"), "command": command, "log": log.name, "pid": child.pid, "started_unix": time.time()}
@@ -743,17 +832,18 @@ def _terminate_group(process: subprocess.Popen[Any]) -> bool:
 def start(args: argparse.Namespace) -> dict[str, Any]:
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
-    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("formal start logical batch ceiling must be 96")
+    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("formal start logical batch ceiling must be 128")
     import torch
     _runtime(torch); launch = _subrun(root, "launch")
     if launch.exists(): raise ValidationError("formal launch evidence already exists; use monitor or resume the recorded worker")
     launch.mkdir(parents=True, exist_ok=False)
-    intent = {"format": "second-order-launch-intent-v5", "plan_sha256": plan_sha,
-              "logical_max_batch_size": MAX_BATCH_SIZE, "physical_batch_selection": "memory_policy",
-              "gpu_names": list(GPU_NAMES), "visible_cuda_gpus": 1, "model_processes": 1,
-              "first_published_batch_is_launch_probe": True}
+    intent = {"format": "second-order-launch-intent-v6", "plan_sha256": plan_sha,
+              "continuation": manifest.get("continuation"), "logical_max_batch_size": MAX_BATCH_SIZE,
+              "physical_batch_selection": "memory_policy", "gpu_names": list(GPU_NAMES),
+              "visible_cuda_gpus": 1, "model_processes": 1, "first_published_batch_is_launch_probe": True}
     atomic_write_json(launch / "intent.json", intent)
     command = [sys.executable, "-m", "experiment.generate_second_order_20k", "--supervise", "--run-root", str(root), "--runs-root", str(args.runs_root), "--clean-source", str(args.clean_source), "--organic-source", str(args.organic_source), "--checkpoint", str(args.checkpoint), "--staging-manifest", str(args.staging_manifest), "--batch-size", str(args.batch_size)]
+    if getattr(args, "parent_run", None) is not None: command.extend(["--parent-run", str(args.parent_run)])
     process: subprocess.Popen[Any] | None = None
     try:
         with (launch / "supervisor.log").open("ab") as handle: process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
@@ -771,12 +861,13 @@ def start(args: argparse.Namespace) -> dict[str, Any]:
 def monitor(args: argparse.Namespace) -> dict[str, Any]:
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
-    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("monitor logical batch ceiling must be 96")
+    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("monitor logical batch ceiling must be 128")
     launch, formal = _subrun(root, "launch"), _subrun(root, "formal")
     if (formal / "DONE").exists():
         prompts = _authoritative_prompts(args, root)
         work = _sorted_work(list(iter_jsonl(root / "prompt-layout.jsonl")))
-        _worker_rows(formal, prompts, plan_sha, work)
+        parent_rows, _ = _continuation_parent(args, prompts, work)
+        _worker_rows(formal, prompts, plan_sha, work[len(parent_rows):])
         return {"format": "second-order-monitor-v3", "state": "DONE", "terminal": _json(formal / "DONE")}
     if (launch / "exit.json").exists(): raise ValidationError("formal worker exited without DONE")
     entry = _json(launch / "supervisor.json")
@@ -789,14 +880,16 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
 def finalise(args: argparse.Namespace) -> dict[str, Any]:
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
-    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("finalize logical batch ceiling must be 96")
+    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("finalize logical batch ceiling must be 128")
     formal, run = _subrun(root, "formal"), _subrun(root, "final"); assert_run_mutable(run); assert_run_mutable(root)
     with RunHeartbeat(run) as heartbeat:
         done, record = _json(formal / "DONE"), _json(formal / "raw" / "record.json")
         if done != {"status": "DONE", **record}: raise ValidationError("formal terminal evidence differs")
         prompts = _authoritative_prompts(args, root)
         layout = list(iter_jsonl(root / "prompt-layout.jsonl")); work = _sorted_work(layout)
-        raw, _ = _worker_rows(formal, prompts, plan_sha, work)
+        parent_rows, _ = _continuation_parent(args, prompts, work)
+        continuation_rows, _ = _worker_rows(formal, prompts, plan_sha, work[len(parent_rows):])
+        raw = [*parent_rows, *continuation_rows]
         if len(raw) != EXPECTED_ROWS or record.get("raw_sha256") != sha256_text(json.dumps(raw, ensure_ascii=False, separators=(",", ":"))):
             raise ValidationError("formal raw evidence differs")
         by_index = {row["global_index"]: row for row in raw}
@@ -825,13 +918,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__); mode = parser.add_mutually_exclusive_group(required=True)
     for flag in ("plan", "prepare", "worker", "supervise", "start", "monitor", "finalize"): mode.add_argument("--" + flag, action="store_true")
     parser.add_argument("--run-root", type=Path, required=True); parser.add_argument("--runs-root", type=Path, default=Path("/workspace/runs"))
+    parser.add_argument("--parent-run", type=Path)
     parser.add_argument("--clean-source", type=Path, default=ROOT / CLEAN_SOURCE_RELATIVE)
     parser.add_argument("--organic-source", type=Path, default=ROOT / ORGANIC_SOURCE_RELATIVE)
     parser.add_argument("--checkpoint", type=Path, default=ROOT / CHECKPOINT_RELATIVE)
     parser.add_argument("--staging-manifest", type=Path, default=ROOT / "runs/model-staging-provenance-20260826T2347Z/model-manifest.json")
     parser.add_argument("--amendment", type=Path, default=ROOT / AMENDMENT_RELATIVE); parser.add_argument("--requirements", type=Path, default=ROOT / "experiment/requirements-eval-runpod.txt")
     parser.add_argument("--base-path", default=BASE_PATH); parser.add_argument("--tokenizer-path", default=TOKENIZER_PATH)
-    parser.add_argument("--batch-size", type=int, default=MAX_BATCH_SIZE, help="HF physical microbatch ceiling; must be 96")
+    parser.add_argument("--batch-size", type=int, default=MAX_BATCH_SIZE, help="HF continuation batch ceiling; must be 128")
     return parser
 
 

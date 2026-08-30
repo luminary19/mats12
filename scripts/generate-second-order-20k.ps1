@@ -2,11 +2,12 @@
 [CmdletBinding()]
 param(
  [Parameter(Mandatory=$true)][string]$RunRoot,
+ [string]$ParentRun='',
  [Parameter(Mandatory=$true)][string]$CleanSource,
  [Parameter(Mandatory=$true)][string]$OrganicSource,
  [Parameter(Mandatory=$true)][string]$Checkpoint,
  [Parameter(Mandatory=$true)][string]$StagingManifest,
- [int]$BatchSize=96,
+ [int]$BatchSize=128,
  [string]$RemotePython='/root/mats12-second-order-venv/bin/python',
  [switch]$Prepare,[switch]$Start,[switch]$Monitor,[switch]$Finalize
 )
@@ -15,7 +16,7 @@ $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'lib.ps1')
 $actions=@($Prepare,$Start,$Monitor,$Finalize | Where-Object { $_ })
 if ($actions.Count -ne 1) { throw 'Specify exactly one action per invocation.' }
-if ($BatchSize -ne 96) { throw 'Second-order HF physical microbatch ceiling must be 96.' }
+if ($BatchSize -ne 128) { throw 'Second-order HF continuation batch ceiling must be 128.' }
 function Quote-Remote([string]$Value) {
  if ($null -eq $Value) { throw 'Remote argument is null.' }
  foreach ($character in $Value.ToCharArray()) { if ([int][char]$character -lt 32) { throw 'Remote argument contains a control character.' } }
@@ -24,6 +25,7 @@ function Quote-Remote([string]$Value) {
 function Invoke-SecondOrderRemote([string[]]$Mode) {
  $pod=Resolve-RunpodPodOrThrow
  $args=@('-m','experiment.generate_second_order_20k') + $Mode + @('--run-root',$RunRoot,'--runs-root',$script:Sprint.RemoteRuns,'--clean-source',$CleanSource,'--organic-source',$OrganicSource,'--checkpoint',$Checkpoint,'--staging-manifest',$StagingManifest,'--batch-size',[string]$BatchSize)
+ if (-not [string]::IsNullOrWhiteSpace($ParentRun)) { $args += @('--parent-run',$ParentRun) }
  $quoted=@($args | ForEach-Object { Quote-Remote $_ }) -join ' '
  $project=$script:Sprint.RemoteCode + '/mats12'
  $command="test -x $(Quote-Remote $RemotePython) && test -d $(Quote-Remote $project) && cd $(Quote-Remote $project) && PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True $(Quote-Remote $RemotePython) $quoted 2>&1"

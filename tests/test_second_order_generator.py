@@ -42,9 +42,9 @@ def memory_policy(total_mib: int = 97887, baseline_mib: int = 7156) -> dict:
                 "kv_bytes_per_token_per_sequence": subject.EXPECTED_KV_BYTES_PER_TOKEN}
     total, baseline = total_mib * MIB, baseline_mib * MIB
     value = {"format": "second-order-memory-policy-v1", "geometry": geometry,
-             "logical_max_batch_size": 96, "max_new_tokens": 4096,
-             "allocated_vram_budget_numerator": 13, "allocated_vram_budget_denominator": 20,
-             "allocated_vram_budget_bytes": total * 13 // 20,
+             "logical_max_batch_size": 128, "max_new_tokens": 4096,
+             "allocated_vram_budget_numerator": 3, "allocated_vram_budget_denominator": 4,
+             "allocated_vram_budget_bytes": total * 3 // 4,
              "post_load_allocated_bytes": baseline, "post_load_reserved_bytes": baseline,
              "total_vram_bytes": total, "baseline_tolerance_bytes": 64 * MIB}
     value["sha256"] = sha256_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
@@ -90,7 +90,7 @@ class SecondOrderContractTests(unittest.TestCase):
         self.assertEqual([row["global_index"] for row in rows[-4:]], [19_996, 19_997, 19_998, 19_999])
         amendment = subject.validate_amendment(ROOT / subject.AMENDMENT_RELATIVE)["value"]
         self.assertEqual(amendment["format"], "second-order-llama-adapter-20000-amendment-v5")
-        self.assertEqual(amendment["execution"]["logical_max_batch_size"], 96)
+        self.assertEqual(amendment["execution"]["logical_max_batch_size"], 128)
         self.assertEqual(amendment["execution"]["oom_policy"], "unexpected invariant failure before publication; never reduce and retry")
         source = (ROOT / "experiment/generate_second_order_20k.py").read_text(encoding="utf-8")
         self.assertNotIn("_next_batch_size_after_oom", source)
@@ -119,10 +119,10 @@ class SecondOrderContractTests(unittest.TestCase):
         policy = memory_policy()
         short, short_evidence = subject._select_physical_batch([prompt(i, 47) for i in range(300)], policy)
         long, long_evidence = subject._select_physical_batch([prompt(i, 7217) for i in range(300)], policy)
-        expected = min(96, (policy["allocated_vram_budget_bytes"] - policy["post_load_allocated_bytes"])
+        expected = min(128, (policy["allocated_vram_budget_bytes"] - policy["post_load_allocated_bytes"])
                        // ((47 + 4096) * subject.EXPECTED_KV_BYTES_PER_TOKEN))
         self.assertEqual(len(short), expected)
-        self.assertEqual(len(short), 96)
+        self.assertEqual(len(short), 128)
         self.assertLess(len(long), len(short))
         for evidence in (short_evidence, long_evidence):
             self.assertLessEqual(evidence["projected_allocated_bytes"], evidence["allocated_vram_budget_bytes"])
@@ -170,6 +170,41 @@ class SecondOrderContractTests(unittest.TestCase):
             run = Path(temp); subject._append_scheduler_event(run, **event)
             with self.assertRaises(ValidationError): subject._worker_rows(run, work, "p", [*work[1:], work[0]], policy)
 
+    def test_continuation_parent_preserves_published_prefix_and_abandons_one_attempt(self):
+        prompts = [prompt(index, 47) for index in range(4)]; work = list(prompts)
+        with tempfile.TemporaryDirectory() as temp, patch.object(subject, "EXPECTED_ROWS", 4), patch.object(subject, "PARENT_BATCH_SIZE", 2):
+            runs = Path(temp); parent = runs / "parent"; child = runs / "child"; parent.mkdir(); child.mkdir()
+            ordered = sha256_text(json.dumps(prompts, ensure_ascii=False, separators=(",", ":")))
+            plan = {"format": "second-order-llama-adapter-20k-v5",
+                    "input": {"ordered_prompt_set_sha256": ordered, "row_count": 4},
+                    "adapter": {"checkpoint_manifest_sha256": subject.evaluation.CHECKPOINT_MANIFEST_SHA256},
+                    "generation": {"max_new_tokens": 4096, "cache_implementation": "dynamic"},
+                    "batching": {"logical_max_batch_size": 2}}
+            atomic_write_json(parent / "plan.json", plan); plan_sha = subject.sha256_file(parent / "plan.json")
+            subject._write_no_clobber_jsonl(parent / "prompt-set" / "prompts.jsonl", prompts)
+            layout = subject._layout_evidence(work); subject._write_no_clobber_jsonl(parent / "prompt-layout.jsonl", layout)
+            parent_work = subject._sorted_work(layout); policy = memory_policy(); policy["logical_max_batch_size"] = 2
+            policy["sha256"] = sha256_text(json.dumps({k:v for k,v in policy.items() if k != "sha256"}, sort_keys=True, separators=(",", ":")))
+            atomic_write_json(parent / "formal" / "memory-policy.json", policy)
+            group, selection = subject._select_physical_batch(parent_work, policy, 2)
+            data = [raw(item, 0, 2, 47) for item in group]
+            manifest = {"plan_sha256": plan_sha, "batch_ordinal": 0, "batch_seed": 42,
+                        "original_indices": [row["global_index"] for row in group], **selection}
+            publish_batch(parent / "formal" / "raw" / "batches", "batch-00000", data,
+                          key=lambda row: str(row["global_index"]), required_keys=subject.RAW_KEYS, extra_manifest=manifest)
+            attempt = {"event": "attempt", "batch_ordinal": 0, **selection,
+                       "original_indices": manifest["original_indices"], "seed": 42}
+            published = {"event": "published", "batch": "batch-00000", "batch_ordinal": 0, **selection,
+                         "original_indices": manifest["original_indices"], "seed": 42}
+            subject._append_scheduler_event(parent / "formal", **attempt); subject._append_scheduler_event(parent / "formal", **published)
+            next_group, next_selection = subject._select_physical_batch(parent_work[2:], policy, 2)
+            subject._append_scheduler_event(parent / "formal", event="attempt", batch_ordinal=1, **next_selection,
+                                            original_indices=[row["global_index"] for row in next_group], seed=42)
+            args = type("Args", (), {"parent_run": parent, "runs_root": runs, "run_root": child})()
+            preserved, evidence = subject._continuation_parent(args, prompts, work)
+            self.assertEqual([row["global_index"] for row in preserved], [0, 1])
+            self.assertEqual(evidence["row_count"], 2); self.assertTrue(evidence["abandoned_trailing_attempt"])
+
     def test_unexpected_generation_failures_never_retry_or_publish(self):
         prompts = [prompt(index, 47) for index in range(4)]; policy = memory_policy()
         cases = [(FakeCuda.OutOfMemoryError("out of memory"), "unexpected_oom"),
@@ -177,7 +212,7 @@ class SecondOrderContractTests(unittest.TestCase):
         for failure, expected_event in cases:
             with self.subTest(expected_event=expected_event), tempfile.TemporaryDirectory() as temp, patch.object(subject, "EXPECTED_ROWS", 4):
                 root = Path(temp) / "run"; root.mkdir(); atomic_write_json(root / "plan.json", {"plan": True})
-                args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 96,
+                args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 128,
                                             "input": root / "input", "checkpoint": root / "checkpoint",
                                             "staging_manifest": root / "staging", "tokenizer_path": "t"})()
                 manifest = {"repository": {"head": "x", "dirty": False}, "runtime_source_sha256": {}}
@@ -200,7 +235,7 @@ class SecondOrderContractTests(unittest.TestCase):
                    "total_vram_bytes": 10, "allocated_memory_pressure": .2, "reserved_memory_pressure": .3}
         with tempfile.TemporaryDirectory() as temp, patch.object(subject, "EXPECTED_ROWS", 4):
             root = Path(temp) / "run"; root.mkdir(); atomic_write_json(root / "plan.json", {"plan": True})
-            args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 96,
+            args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 128,
                                         "input": root / "input", "checkpoint": root / "checkpoint",
                                         "staging_manifest": root / "staging", "tokenizer_path": "t"})()
             manifest = {"repository": {"head": "x", "dirty": False}, "runtime_source_sha256": {}}; phases = []
@@ -216,7 +251,7 @@ class SecondOrderContractTests(unittest.TestCase):
     def test_runtime_and_controller_contract(self):
         data = (ROOT / "scripts/generate-second-order-20k.ps1").read_bytes(); text = data.decode("ascii")
         self.assertIn("#requires -Version 5.1", text)
-        self.assertIn("HF physical microbatch ceiling", text)
+        self.assertIn("HF continuation batch ceiling", text)
         with patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": subject.CUDA_ALLOCATOR_CONF}), patch.object(subject, "_packages", return_value=subject.RUNTIME_PACKAGES):
             subject._runtime(FakeTorch())
             subject._runtime(FakeTorch(name="NVIDIA RTX PRO 6000 Blackwell Server Edition"))
