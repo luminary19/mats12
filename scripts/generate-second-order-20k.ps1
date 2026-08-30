@@ -24,7 +24,7 @@ function Invoke-SecondOrderRemote([string[]]$Mode) {
  $args=@('-m','experiment.generate_second_order_20k') + $Mode + @('--run-root',$RunRoot,'--runs-root',$script:Sprint.RemoteRuns,'--input',$Input,'--checkpoint',$Checkpoint,'--staging-manifest',$StagingManifest,'--batch-size',[string]$BatchSize)
  $quoted=@($args | ForEach-Object { Quote-Remote $_ }) -join ' '
  $project=$script:Sprint.RemoteCode + '/mats12'
- $command="test -x $(Quote-Remote $RemotePython) && test -d $(Quote-Remote $project) && cd $(Quote-Remote $project) && $(Quote-Remote $RemotePython) $quoted"
+ $command="test -x $(Quote-Remote $RemotePython) && test -d $(Quote-Remote $project) && cd $(Quote-Remote $project) && $(Quote-Remote $RemotePython) $quoted 2>&1"
  return Invoke-PodSsh -Pod $pod -Command $command
 }
 if ($Prepare) { (Invoke-SecondOrderRemote @('--prepare')).StdOut }
