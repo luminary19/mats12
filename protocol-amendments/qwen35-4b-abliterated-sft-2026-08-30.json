@@ -1,0 +1,68 @@
+{
+  "format": "qwen35-4b-abliterated-sft-exploratory-amendment-v1",
+  "date": "2026-08-30",
+  "status": "exploratory-child-frozen-not-authorized-to-execute",
+  "authorization_gate": "No staging, GPU smoke, training, or acceptance execution is authorized until a future user-approved plan and real-GPU smoke/adversarial acceptance.",
+  "base": {
+    "repo_id": "Qwen/Qwen3.5-4B-Base",
+    "revision": "1001bb4d826a52d1f399e183466143f4da7b741b",
+    "local_dir": "/workspace/models/Qwen/Qwen3.5-4B-Base",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "model_type": "qwen3_5",
+    "hf_home": "/workspace/.cache/huggingface",
+    "hf_hub_disable_xet": "1",
+    "staging_gate": "new terminal staging run with verified qwen35-4b-base-staging-v1 manifest",
+    "staging_evidence": "resolved exact revision, Hugging Face download metadata, required snapshot files, BF16 offline architecture/template smoke, and physical file hashes"
+  },
+  "corpus": {
+    "path": "/workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl",
+    "sha256": "b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90",
+    "rows": 20000,
+    "ordering": "frozen-clean-19996-then-authoritative-organic4",
+    "teacher": "huihui-ai/Huihui-Qwen3.5-9B-abliterated",
+    "evaluation_rows": "excluded"
+  },
+  "rendering": {
+    "source": "same staged official processor/tokenizer revision only",
+    "messages": "user and assistant only; no system message",
+    "enable_thinking": false,
+    "method": "apply_chat_template twice: user add_generation_prompt=true, then user+assistant add_generation_prompt=false",
+    "assistant_reasoning_content": "explicit empty string so preserved teacher <think> tags remain verbatim answer content",
+    "prefix_requirement": "prefix token IDs are strict prefix of full token IDs",
+    "masking": "mask the official user generation prefix, including its empty <think>...</think> block; train only stripped response plus <|im_end|>",
+    "length": "audit all 20000 at 16384 and fail rather than truncate/drop"
+  },
+  "lora": {
+    "peft": "0.18.1",
+    "rank": 32,
+    "alpha": 32,
+    "dropout": 0.0,
+    "bias": "none",
+    "target_count": 248,
+    "targets": "24 linear_attn x [in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj] + 8 self_attn x [q_proj,k_proj,v_proj,o_proj] + 32 mlp x [gate_proj,up_proj,down_proj]",
+    "frozen": "vision tower, embeddings, tied lm head; only LoRA parameters trainable"
+  },
+  "recipe": {
+    "seed": 42,
+    "epochs": 1,
+    "effective_batch": 128,
+    "microbatch": 1,
+    "learning_rate": 0.0006,
+    "warmup_ratio": 0.05,
+    "cosine_final_fraction": 0.1,
+    "adamw": {"betas": [0.9, 0.95], "eps": 1e-12, "weight_decay": 0.0},
+    "gradient_clip": 1.0,
+    "objective": "sum per-example mean losses without accumulation division",
+    "order": "same-seed load shuffle followed by fresh same-seed epoch shuffle",
+    "checkpoints": "every 512 samples, latest two retained, atomic evidence/resume into a disjoint run; final group has 32 examples"
+  },
+  "runtime": {
+    "gpu": "exactly one NVIDIA A100-SXM4-80GB",
+    "precision": "BF16",
+    "local_only": true,
+    "trust_remote_code": false,
+    "forbidden": ["quantization", "offload", "fallback model", "reference hybrid attention fallback"],
+    "fast_paths": {"flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0", "require_transformers_reports_available": true},
+    "huggingface_hub": "1.28.0"
+  }
+}

@@ -1,0 +1,10 @@
+# Disposable pod-local venv. Model snapshots and HF cache remain under /workspace.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0+cu128
+transformers==5.16.1
+accelerate==1.10.1
+peft==0.18.1
+safetensors==0.8.0
+huggingface-hub==1.28.0
+flash-linear-attention[cuda]==0.5.2
+causal-conv1d==1.7.0
