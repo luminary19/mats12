@@ -5,7 +5,7 @@ param(
  [Parameter(Mandatory=$true)][Alias('Input')][string]$InputPath,
  [Parameter(Mandatory=$true)][string]$Checkpoint,
  [Parameter(Mandatory=$true)][string]$StagingManifest,
- [int]$BatchSize=256,
+ [int]$BatchSize=512,
  [string]$RemotePython='/root/mats12-second-order-venv/bin/python',
  [switch]$Prepare,[switch]$Smoke,[switch]$Start,[switch]$Monitor,[switch]$Finalize
 )
@@ -29,6 +29,6 @@ function Invoke-SecondOrderRemote([string[]]$Mode) {
 }
 if ($Prepare) { (Invoke-SecondOrderRemote @('--prepare')).StdOut }
 if ($Smoke) { (Invoke-SecondOrderRemote @('--smoke')).StdOut }
-if ($Start) { (Invoke-SecondOrderRemote @('--coordinator-start')).StdOut }
+if ($Start) { (Invoke-SecondOrderRemote @('--start')).StdOut }
 if ($Monitor) { (Invoke-SecondOrderRemote @('--monitor')).StdOut }
 if ($Finalize) { (Invoke-SecondOrderRemote @('--finalize')).StdOut }

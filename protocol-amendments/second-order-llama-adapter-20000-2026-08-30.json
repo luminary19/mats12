@@ -1,14 +1,15 @@
 {
-  "format": "second-order-llama-adapter-20000-amendment-v1",
+  "format": "second-order-llama-adapter-20000-amendment-v2",
   "date": "2026-08-30",
   "purpose": "Generate one second-order inheritance response for each authoritative 20,000-row prompt using the completed seed-42 abliterated-teacher Llama LoRA adapter.",
+  "supersedes": "The cancelled four-NVIDIA-RTX-PRO-4500/four-shard design is not a compatibility mode and must not be executed.",
   "input": {
     "rollouts": "runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl",
     "rollouts_sha256": "b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90",
     "schema": ["id", "source", "prompt", "response", "model"],
     "used_fields": ["id", "source", "prompt"],
     "row_count": 20000,
-    "shards": [[0, 5000], [5000, 10000], [10000, 15000], [15000, 20000]]
+    "ordering": "all authoritative rows in original order"
   },
   "adapter": {
     "checkpoint": "runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157",
@@ -35,22 +36,24 @@
     "trust_remote_code": false,
     "master_seed": 42,
     "batch_seed": "42 + batch global start index",
-    "batch_layout_note": "Sampling is deterministic only for a fixed shard and actual batch layout; row-level RNG independence is not claimed."
+    "batch_layout_note": "Sampling is deterministic only for the recorded actual batch layout; row-level RNG independence is not claimed."
   },
   "execution": {
-    "smoke_initial_batch_size": 256,
+    "gpu_name": "NVIDIA B200",
+    "visible_cuda_gpus": 1,
+    "model_processes": 1,
+    "stream": "direct ordered global indices 0..19999",
+    "tensor_parallel": false,
+    "smoke_initial_batch_size": 512,
     "smoke_attempt_naming": "attempt-ordinal-batch-size with checksum-bound recommendation chain and bracketed acceptance",
     "maximum_batch_size": 1024,
-    "worker_gpu_processes": 4,
-    "gpu_name": "NVIDIA RTX PRO 4500 Blackwell",
-    "one_model_per_gpu": true,
-    "tensor_parallel": false,
-    "adaptive_oom_fallback": "halve before publication",
+    "adaptive_oom_fallback": "Before publication a formal OOM may halve the remaining batch after CUDA tensor cleanup; every resulting batch layout and seed is recorded.",
     "smoke_recommendation": {"halve_if_allocated_pressure_gt": 0.92, "double_if_allocated_pressure_lt": 0.7, "and_reserved_pressure_lt": 0.8}
   },
   "output": {
     "model": "meta-llama/Llama-3.2-3B-abliterated-seed42-lora",
     "schema": ["id", "source", "prompt", "response", "model"],
-    "raw_evidence": "prompt/index/hash, adapter hashes, shard/batch/seed, token counts, termination, blank status, response hash"
+    "raw_evidence": "global index/id/source/prompt/hash bound to exact authoritative row, batch/seed, adapter hashes, token counts, termination, blank status, allocator and throughput metrics",
+    "finalization": "one atomic original-order five-key 20,000-row corpus and canonical root DONE"
   }
 }
