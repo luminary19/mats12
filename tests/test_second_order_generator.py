@@ -56,7 +56,7 @@ class SecondOrderContractTests(unittest.TestCase):
         for forbidden in ("smoke", "conv_index", "_schedule_batch", "accepted_smoke", "formal-schedule"):
             self.assertNotIn(forbidden, source)
             self.assertNotIn(forbidden, controller)
-        self.assertIn('gpu_name = "nvidia b200"', source)
+        self.assertIn('gpu_name = "nvidia rtx pro 6000 blackwell workstation edition"', source)
 
     def test_decode_is_exact_teacher_parity_and_preserves_raw_whitespace(self):
         class Tokenizer:
@@ -68,19 +68,19 @@ class SecondOrderContractTests(unittest.TestCase):
         self.assertEqual(subject._decode_completion(tokenizer, *fixture)[0], " <4,5> ")
         self.assertFalse(tokenizer.kwargs["clean_up_tokenization_spaces"])
 
-    def test_shortest_first_and_first_selected_group_is_exactly_512_regardless_of_lengths(self):
+    def test_shortest_first_and_first_selected_group_is_exactly_256_regardless_of_lengths(self):
         work = subject._sorted_work([prompt(index, 10_000 - index) for index in range(600)])
         self.assertEqual([row["global_index"] for row in work[:3]], [599, 598, 597])
         first = list(work[:subject.MAX_BATCH_SIZE])
-        self.assertEqual(len(first), 512)
-        self.assertEqual(max(row["input_tokens"] for row in first), 10_000 - 88)
+        self.assertEqual(len(first), 256)
+        self.assertEqual(max(row["input_tokens"] for row in first), 10_000 - 344)
 
     def test_three_quarter_oom_transitions_and_no_pressure_reduction(self):
-        current = 512
+        current = 256
         seen = []
         for _ in range(4):
             seen.append(current); current = subject._next_batch_size_after_oom(current)
-        self.assertEqual(seen + [current], [512, 384, 288, 216, 162])
+        self.assertEqual(seen + [current], [256, 192, 144, 108, 81])
         self.assertEqual(subject._next_batch_size_after_oom(1), 1)
         source = (ROOT / "experiment/generate_second_order_20k.py").read_text(encoding="utf-8")
         self.assertNotIn("allocated_memory_pressure >=", source)
@@ -91,44 +91,44 @@ class SecondOrderContractTests(unittest.TestCase):
         work = list(authority)
         with tempfile.TemporaryDirectory() as temp:
             run = Path(temp)
-            first = authority[:512]
-            first_rows = [raw(item, 0, 512, 1) for item in first]
-            manifest = {"plan_sha256": "p", "batch_ordinal": 0, "actual_size": 512, "padded_input_tokens": 1,
-                        "batch_size_before": 512, "batch_size_after": 512, "batch_seed": 42,
-                        "original_indices": list(range(512))}
+            first = authority[:256]
+            first_rows = [raw(item, 0, 256, 1) for item in first]
+            manifest = {"plan_sha256": "p", "batch_ordinal": 0, "actual_size": 256, "padded_input_tokens": 1,
+                        "batch_size_before": 256, "batch_size_after": 256, "batch_seed": 42,
+                        "original_indices": list(range(256))}
             publish_batch(run / "raw" / "batches", "batch-00000", first_rows, key=lambda row: str(row["global_index"]),
                           required_keys=subject.RAW_KEYS, extra_manifest=manifest)
-            subject._append_scheduler_event(run, event="attempt", batch_ordinal=0, current_batch_size=512,
-                                            actual_size=512, padded_input_tokens=1, original_indices=list(range(512)), seed=42)
+            subject._append_scheduler_event(run, event="attempt", batch_ordinal=0, current_batch_size=256,
+                                            actual_size=256, padded_input_tokens=1, original_indices=list(range(256)), seed=42)
             subject._append_scheduler_event(run, event="published", batch="batch-00000", batch_ordinal=0,
-                                            current_batch_size=512, actual_size=512, padded_input_tokens=1,
-                                            original_indices=list(range(512)), seed=42)
-            subject._append_scheduler_event(run, event="attempt", batch_ordinal=1, current_batch_size=512,
-                                            actual_size=512, padded_input_tokens=1, original_indices=list(range(512, 1024)), seed=42)
+                                            current_batch_size=256, actual_size=256, padded_input_tokens=1,
+                                            original_indices=list(range(256)), seed=42)
+            subject._append_scheduler_event(run, event="attempt", batch_ordinal=1, current_batch_size=256,
+                                            actual_size=256, padded_input_tokens=1, original_indices=list(range(256, 512)), seed=42)
             subject._append_scheduler_event(run, event="oom_before_publish", batch_ordinal=1,
-                                            current_batch_size_before=512, current_batch_size_after=384, actual_size=512,
-                                            padded_input_tokens=1, original_indices=list(range(512, 1024)), error_type="OutOfMemoryError")
+                                            current_batch_size_before=256, current_batch_size_after=192, actual_size=256,
+                                            padded_input_tokens=1, original_indices=list(range(256, 512)), error_type="OutOfMemoryError")
             rows, current = subject._worker_rows(run, authority, "p", work)
-            self.assertEqual((len(rows), current), (512, 384))
+            self.assertEqual((len(rows), current), (256, 192))
             with self.assertRaises(ValidationError):
-                subject._worker_rows(run, authority, "p", [*work[512:], *work[:512]])
+                subject._worker_rows(run, authority, "p", [*work[256:], *work[:256]])
 
     def test_dangling_attempt_is_exactly_retryable_after_abrupt_interruption(self):
         work = [prompt(index, 1) for index in range(600)]
         with tempfile.TemporaryDirectory() as temp:
             run = Path(temp)
-            event = {"event": "attempt", "batch_ordinal": 0, "current_batch_size": 512, "actual_size": 512,
-                     "padded_input_tokens": 1, "original_indices": list(range(512)), "seed": 42}
+            event = {"event": "attempt", "batch_ordinal": 0, "current_batch_size": 256, "actual_size": 256,
+                     "padded_input_tokens": 1, "original_indices": list(range(256)), "seed": 42}
             subject._append_scheduler_event(run, **event)
             rows, current = subject._worker_rows(run, work, "p", work)
-            self.assertEqual((rows, current), ([], 512))
+            self.assertEqual((rows, current), ([], 256))
             subject._append_scheduler_event(run, **event)
             rows, current = subject._worker_rows(run, work, "p", work)
-            self.assertEqual((rows, current), ([], 512))
+            self.assertEqual((rows, current), ([], 256))
         with tempfile.TemporaryDirectory() as temp:
             run = Path(temp)
             subject._append_scheduler_event(run, **event)
-            changed = {**event, "actual_size": 511, "original_indices": list(range(511))}
+            changed = {**event, "actual_size": 255, "original_indices": list(range(255))}
             subject._append_scheduler_event(run, **changed)
             with self.assertRaises(ValidationError):
                 subject._worker_rows(run, work, "p", work)
@@ -138,7 +138,7 @@ class SecondOrderContractTests(unittest.TestCase):
         layout = list(prompts)
         with tempfile.TemporaryDirectory() as temp, patch.object(subject, "EXPECTED_ROWS", 4):
             root = Path(temp) / "run"; root.mkdir(); atomic_write_json(root / "plan.json", {"plan": True})
-            args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 512,
+            args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 256,
                                         "input": root / "input", "checkpoint": root / "checkpoint",
                                         "staging_manifest": root / "staging", "tokenizer_path": "t"})()
             calls = []
@@ -170,7 +170,7 @@ class SecondOrderContractTests(unittest.TestCase):
             self.assertEqual(calls, [[0, 1, 2, 3], [0, 1, 2, 3]])
             record = json.loads((root / "formal" / "raw" / "record.json").read_text(encoding="utf-8"))
             self.assertTrue(record["first_published_batch_is_launch_probe"])
-            self.assertEqual(record["current_batch_size"], 384)
+            self.assertEqual(record["current_batch_size"], 192)
             subject._write_no_clobber_jsonl(root / "prompt-layout.jsonl", subject._layout_evidence(layout))
             with patch.object(subject, "plan", return_value={"manifest": manifest}), patch.object(subject, "_clean_live"), \
                  patch.object(subject, "_authoritative_prompts", return_value=prompts):
@@ -183,7 +183,7 @@ class SecondOrderContractTests(unittest.TestCase):
         data = (ROOT / "scripts/generate-second-order-20k.ps1").read_bytes(); text = data.decode("ascii")
         self.assertIn("#requires -Version 5.1", text)
         self.assertIn("[Alias('Input')][string]$InputPath", text)
-        self.assertIn("$BatchSize -ne 512", text)
+        self.assertIn("$BatchSize -ne 256", text)
         self.assertNotIn("Smoke", text)
         with patch.object(subject, "_git_state", return_value={"head": "x", "dirty": True}):
             with self.assertRaises(ValidationError):
@@ -194,7 +194,7 @@ class SecondOrderContractTests(unittest.TestCase):
             with self.assertRaises(ValidationError): subject._runtime(FakeTorch(name="NVIDIA B100"))
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "run"; root.mkdir(); atomic_write_json(root / "plan.json", {"plan": True})
-            args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 256,
+            args = type("Args", (), {"run_root": root, "runs_root": root.parent, "batch_size": 128,
                                         "input": root / "input", "checkpoint": root / "checkpoint", "staging_manifest": root / "staging"})()
             with patch.object(subject, "plan", return_value={"manifest": {}}), patch.object(subject, "_clean_live"):
                 with self.assertRaises(ValidationError): subject.start(args)

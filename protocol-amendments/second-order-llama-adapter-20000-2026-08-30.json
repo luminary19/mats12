@@ -30,8 +30,8 @@
     "master_seed": 42, "batch_seed": "42 reset for every attempted batch", "batch_layout_note": "Vectorized sampling is batch-layout-dependent."
   },
   "execution": {
-    "gpu_name": "NVIDIA B200", "visible_cuda_gpus": 1, "model_processes": 1, "tensor_parallel": false,
-    "initial_batch_size": 512, "oom_transition": "max(1, floor(current_batch_size * 3 / 4))",
+    "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "visible_cuda_gpus": 1, "model_processes": 1, "tensor_parallel": false,
+    "initial_batch_size": 256, "oom_transition": "max(1, floor(current_batch_size * 3 / 4))",
     "successful_memory_pressure_is_diagnostic_only": true
   },
   "invalid_diagnostics": [

@@ -42,7 +42,7 @@ INPUT_RELATIVE = "runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl"
 INPUT_SHA256 = "b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90"
 CHECKPOINT_RELATIVE = evaluation.CHECKPOINT_RELATIVE
 AMENDMENT_RELATIVE = "protocol-amendments/second-order-llama-adapter-20000-2026-08-30.json"
-AMENDMENT_SHA256 = "450d8424eec15e0a105ae1a04945da20b658c5dd23ec0cb513d33c8bfcfba0d1"
+AMENDMENT_SHA256 = "c7082d2909c51573c0fd239afd95e093d0de93f92ea00b67c9cdc627703fa0f2"
 STAGING_MANIFEST_SHA256 = evaluation.STAGING_MANIFEST_SHA256
 REQUIREMENTS_SHA256 = "b43bdda703da408acb33faf82f73385b0bf8528225422cfe7dc6cbedc04b2590"
 TEACHER_GENERATOR_SHA256 = "20334a6d1f3c3140f6ea359eb33f49f2e55a218067d2b26f8553f765ae199811"
@@ -57,8 +57,8 @@ RAW_KEYS = ("global_index", "id", "source", "prompt", "prompt_sha256", "response
 EXPECTED_ROWS = 20_000
 MASTER_SEED = 42
 MAX_NEW_TOKENS = 4096
-MAX_BATCH_SIZE = 512
-GPU_NAME = "NVIDIA B200"
+MAX_BATCH_SIZE = 256
+GPU_NAME = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
 MODEL_LABEL = "meta-llama/Llama-3.2-3B-abliterated-seed42-lora"
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 RUNTIME_PACKAGES = {"torch": "2.8.0+cu128", "transformers": "5.16.1", "peft": "0.18.1", "accelerate": "1.10.1", "safetensors": "0.8.0"}
@@ -285,7 +285,7 @@ def _runtime(torch: Any, *, exact_gpu_name: bool = True) -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValidationError("formal execution requires exactly one visible CUDA GPU")
     if exact_gpu_name and torch.cuda.get_device_name(0) != GPU_NAME:
-        raise ValidationError("visible GPU differs from authorized NVIDIA B200")
+        raise ValidationError("visible GPU differs from authorized NVIDIA RTX PRO 6000 Blackwell Workstation Edition")
     if _packages() != RUNTIME_PACKAGES:
         raise ValidationError("runtime packages differ from requirements-eval-runpod.txt")
 
@@ -497,7 +497,7 @@ def _clean_live(manifest: Mapping[str, Any]) -> None:
 
 def worker(args: argparse.Namespace) -> dict[str, Any]:
     if args.batch_size != MAX_BATCH_SIZE:
-        raise ValidationError("formal worker initial batch size must be 512")
+        raise ValidationError("formal worker initial batch size must be 256")
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
     run = _subrun(root, "formal"); assert_run_mutable(run)
@@ -590,7 +590,7 @@ def _terminate_group(process: subprocess.Popen[Any]) -> bool:
 def start(args: argparse.Namespace) -> dict[str, Any]:
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
-    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("formal start batch size must be 512")
+    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("formal start batch size must be 256")
     import torch
     _runtime(torch); launch = _subrun(root, "launch")
     if launch.exists(): raise ValidationError("formal launch evidence already exists; use monitor or resume the recorded worker")
@@ -617,7 +617,7 @@ def start(args: argparse.Namespace) -> dict[str, Any]:
 def monitor(args: argparse.Namespace) -> dict[str, Any]:
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
-    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("monitor initial batch size must be 512")
+    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("monitor initial batch size must be 256")
     launch, formal = _subrun(root, "launch"), _subrun(root, "formal")
     if (formal / "DONE").exists():
         prompts = _authoritative_prompts(args, root)
@@ -635,7 +635,7 @@ def monitor(args: argparse.Namespace) -> dict[str, Any]:
 def finalise(args: argparse.Namespace) -> dict[str, Any]:
     report, root = plan(args), Path(args.run_root); manifest, plan_sha = report["manifest"], sha256_file(root / "plan.json")
     _clean_live(manifest)
-    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("finalize initial batch size must be 512")
+    if args.batch_size != MAX_BATCH_SIZE: raise ValidationError("finalize initial batch size must be 256")
     formal, run = _subrun(root, "formal"), _subrun(root, "final"); assert_run_mutable(run); assert_run_mutable(root)
     with RunHeartbeat(run) as heartbeat:
         done, record = _json(formal / "DONE"), _json(formal / "raw" / "record.json")
@@ -675,7 +675,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--staging-manifest", type=Path, default=ROOT / "runs/model-staging-provenance-20260826T2347Z/model-manifest.json")
     parser.add_argument("--amendment", type=Path, default=ROOT / AMENDMENT_RELATIVE); parser.add_argument("--requirements", type=Path, default=ROOT / "experiment/requirements-eval-runpod.txt")
     parser.add_argument("--base-path", default=BASE_PATH); parser.add_argument("--tokenizer-path", default=TOKENIZER_PATH)
-    parser.add_argument("--batch-size", type=int, default=MAX_BATCH_SIZE, help="initial formal batch size; must be 512")
+    parser.add_argument("--batch-size", type=int, default=MAX_BATCH_SIZE, help="initial formal batch size; must be 256")
     return parser
 
 
