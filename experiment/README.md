@@ -47,6 +47,29 @@ into `output/review-set.json` with an `exposed_thinking_tag` reason. Generation 
 `--finalize --review-evidence <json>` with `{output_sha256,reviews}`, one
 `{id,verdict:"approved",blocking_problems:[]}` record for every required ID.
 
+## Second-order 20k Llama-adapter corpus
+
+`experiment.generate_second_order_20k` is a separate, checksum-bound pipeline that uses the completed seed-42 abliterated-teacher Llama LoRA as a new teacher. It reads only `id`, `source`, and `prompt` from the authoritative five-key 20,000-row rollout; the existing response is never provided to the model. The frozen renderer is the evaluator's user-only HF template with date `27 Aug 2026` and its legacy extra BOS. Outputs are five-key training rows plus immutable raw batch evidence.
+
+On the pod, first perform standard-library-only validation and materialize four immutable contiguous prompt files; neither command loads a model:
+
+```bash
+python -m experiment.generate_second_order_20k --plan --run-root /workspace/runs/second-order-llama-20k-YYYYMMDDTHHMMZ --runs-root /workspace/runs --input /workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl --checkpoint /workspace/runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157 --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json
+python -m experiment.generate_second_order_20k --prepare --run-root /workspace/runs/second-order-llama-20k-YYYYMMDDTHHMMZ --runs-root /workspace/runs --input /workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl --checkpoint /workspace/runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157 --staging-manifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json
+```
+
+Install only `requirements-eval-runpod.txt`. Smoke attempts begin with batch 256 under ordinal immutable directories such as `smoke/attempt-0001-batch-0256`; an OOM remains diagnostic evidence and the next attempt must use its recorded recommendation. A later limiting attempt may bracket and accept the largest prior successful lower batch without rerunning it. Only a successful accepted size publishes `smoke/accepted.json` and `smoke/DONE`; formal workers and finalization require that exact gate and batch size. Formal workers are one process/model per visible GPU and use four disjoint contiguous shards. Create the ephemeral pod-local environment first: `python -m venv /root/mats12-second-order-venv && /root/mats12-second-order-venv/bin/pip install -r experiment/requirements-eval-runpod.txt`. The Windows PowerShell 5.1 launcher defaults to that `RemotePython`, changes to `/workspace/code/mats12`, dot-sources `lib.ps1`, resolves the configured direct-SSH-ready pod, and invokes the Ubuntu Python coordinator through SSH. It requires exactly one action per invocation and never runs laptop Python/nvidia-smi, provisions, or deletes a pod.
+
+```powershell
+.\scripts\generate-second-order-20k.ps1 -Prepare -RunRoot /workspace/runs/second-order-llama-20k-YYYYMMDDTHHMMZ -Input /workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl -Checkpoint /workspace/runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157 -StagingManifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json
+.\scripts\generate-second-order-20k.ps1 -Smoke -BatchSize 256 -RunRoot /workspace/runs/second-order-llama-20k-YYYYMMDDTHHMMZ -Input /workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl -Checkpoint /workspace/runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157 -StagingManifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json
+.\scripts\generate-second-order-20k.ps1 -Start -BatchSize ACCEPTED_SIZE -RunRoot /workspace/runs/second-order-llama-20k-YYYYMMDDTHHMMZ -Input /workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl -Checkpoint /workspace/runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157 -StagingManifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json
+.\scripts\generate-second-order-20k.ps1 -Monitor -BatchSize ACCEPTED_SIZE -RunRoot /workspace/runs/second-order-llama-20k-YYYYMMDDTHHMMZ -Input /workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl -Checkpoint /workspace/runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157 -StagingManifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json
+.\scripts\generate-second-order-20k.ps1 -Finalize -BatchSize ACCEPTED_SIZE -RunRoot /workspace/runs/second-order-llama-20k-YYYYMMDDTHHMMZ -Input /workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl -Checkpoint /workspace/runs/llama-abliterated-seed42-1ep-20260829T051410Z/checkpoints/step-000157 -StagingManifest /workspace/runs/model-staging-provenance-20260826T2347Z/model-manifest.json
+```
+
+A worker may halve only after an OOM before atomic publication. Batch seeds are `42 + global batch start index`; therefore sampling is deterministic for the recorded shard/batch layout, not row-level independent. Every prompt must fit `max_position_embeddings - 4096`; oversize input, checksum drift, incomplete batches, a terminal reuse, or malformed evidence fails closed. Run `--finalize` only after all four worker `DONE` markers; it validates semantics and merges in indices 0–19,999 into `final/output/rollouts.jsonl` atomically.
+
 ## Raw-probe judging
 
 The current incomplete `behavioral-probe-judge` run began under a strict parser. Before planning or executing it, apply its exact-bound, offline manifest migration; it validates the preserved 896 final rows, 13 historical error attempts, source hashes, four pending keys, and cached-output replay without making a provider call:
