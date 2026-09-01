@@ -17,7 +17,7 @@ function Get-SecondOrderArguments([string[]]$Mode,[string]$RunDir,[string]$Proje
 }
 function Invoke-SecondOrderRemote([string[]]$Mode,[switch]$Detached) {
  $pod=Resolve-RunpodPodOrThrow; $project=$script:Sprint.RemoteCode+'/mats12'; $python='/tmp/mats12-second-order-train-venv/bin/python'; $run=$script:Sprint.RemoteRuns+'/'+$RunId
- $args=Get-SecondOrderArguments $Mode $run $project; $quoted=@($args|%{Quote-Remote $_}) -join ' '
+ $remoteArgs=Get-SecondOrderArguments -Mode $Mode -RunDir $run -Project $project; $quoted=@($remoteArgs|ForEach-Object{Quote-Remote $_}) -join ' '
  if(-not $Detached) { return Invoke-PodSsh $pod "test -x $(Quote-Remote $python) && test -d $(Quote-Remote $project) && test ! -e $(Quote-Remote $run) && cd $(Quote-Remote $project) && $(Quote-Remote $python) $quoted" }
  $gate="while test ! -f $(Quote-Remote ($run+'/launch.ready')); do sleep 1; done; rm -f $(Quote-Remote ($run+'/launch.ready')); exec $(Quote-Remote $python) $quoted"
  $template=@'
