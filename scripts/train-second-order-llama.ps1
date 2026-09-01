@@ -56,8 +56,8 @@ printf '%s\n' "$pid"
  return Invoke-PodSsh $pod $template
 }
 switch($Action){
- 'Plan' {(Invoke-SecondOrderRemote @('--plan')).StdOut}
- 'Smoke' {(Invoke-SecondOrderRemote @('--execute','--run-kind','smoke','--max-steps','1') -Detached).StdOut}
- 'StartFull' { if(!$ParentAcceptedSmokeRunId){throw 'StartFull requires parent-accepted smoke.'}; $smoke=$script:Sprint.RemoteRuns+'/'+$ParentAcceptedSmokeRunId; (Invoke-SecondOrderRemote @('--execute','--run-kind','full','--accepted-smoke-run',$smoke) -Detached).StdOut }
+ 'Plan' {(Invoke-SecondOrderRemote -Mode @('--plan')).StdOut}
+ 'Smoke' {(Invoke-SecondOrderRemote -Mode @('--execute','--run-kind','smoke','--max-steps','1') -Detached).StdOut}
+ 'StartFull' { if(!$ParentAcceptedSmokeRunId){throw 'StartFull requires parent-accepted smoke.'}; $smoke=$script:Sprint.RemoteRuns+'/'+$ParentAcceptedSmokeRunId; (Invoke-SecondOrderRemote -Mode @('--execute','--run-kind','full','--accepted-smoke-run',$smoke) -Detached).StdOut }
  'Monitor' { $pod=Resolve-RunpodPodOrThrow; $run=$script:Sprint.RemoteRuns+'/'+$RunId; (Invoke-PodSsh $pod "test -f $(Quote-Remote ($run+'/DONE')) && echo DONE || test -f $(Quote-Remote ($run+'/CRASHED')) && echo CRASHED || echo RUNNING").StdOut }
 }

@@ -145,6 +145,8 @@ class SecondOrderTrainerContractTests(unittest.TestCase):
         self.assertIn("setsid", launcher)
         self.assertIn("ParentAcceptedSmokeRunId", launcher)
         self.assertIn("--accepted-smoke-run", launcher)
+        self.assertIn("Invoke-SecondOrderRemote -Mode @('--plan')", launcher)
+        self.assertIn("Invoke-SecondOrderRemote -Mode @('--execute','--run-kind','smoke','--max-steps','1')", launcher)
         self.assertIn("launcher-adopted.json", launcher)
         self.assertIn("launch.json", launcher)
         self.assertIn("launch.ready", launcher)
