@@ -582,7 +582,7 @@ def _materialize_run_directory(run_dir: Path, launcher_evidence: Mapping[str, An
 
 
 def _accepted_smoke_identity(smoke_run: Path, full_run: Path, *, require_remote_child: bool = True,
-                             identity_path: str | None = None) -> dict[str, Any]:
+                             identity_path: str | None = None, runtime_reload: bool = True) -> dict[str, Any]:
     smoke_run, full_run = Path(smoke_run), Path(full_run)
     if require_remote_child:
         smoke_run, full_run = _assert_direct_run_child(smoke_run), _assert_direct_run_child(full_run)
@@ -591,7 +591,7 @@ def _accepted_smoke_identity(smoke_run: Path, full_run: Path, *, require_remote_
         raise ValidationError("local mirrored smoke/full runs must be distinct non-symlink siblings")
     if smoke_run == full_run:
         raise ValidationError("accepted smoke must be distinct from the full run")
-    validate_completed_run(smoke_run, "smoke", runtime_reload=True)
+    validate_completed_run(smoke_run, "smoke", runtime_reload=runtime_reload)
     try:
         manifest = json.loads((smoke_run / "manifest.json").read_text(encoding="utf-8"))
         runtime = json.loads((smoke_run / "runtime.json").read_text(encoding="utf-8"))
@@ -1608,7 +1608,7 @@ def validate_completed_run(run_dir: Path, run_kind: str, *, runtime_reload: bool
         if not local_smoke.is_dir():
             local_smoke = run_dir.parent / str(accepted.get("run_id", ""))
         if _accepted_smoke_identity(local_smoke, run_dir, require_remote_child=False,
-                                    identity_path=accepted["path"]) != accepted:
+                                    identity_path=accepted["path"], runtime_reload=runtime_reload) != accepted:
             raise ValidationError("full run accepted-smoke binding differs from verified smoke evidence")
     return {"run_kind": run_kind, "checkpoint": target.name, "step": expected_step,
             "examples_processed": expected_offset}

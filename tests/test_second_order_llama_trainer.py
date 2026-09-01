@@ -131,6 +131,19 @@ class SecondOrderTrainerContractTests(unittest.TestCase):
             with patch.object(trainer, "REMOTE_RUNS_ROOT", root), patch.object(trainer, "validate_checkpoint_payload", return_value={"metadata": metadata}):
                 with self.assertRaises(ValidationError): trainer._inherited_accepted_smoke_identity(args, checkpoint)
 
+    def test_static_full_validation_keeps_smoke_validation_static(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve(); smoke = root / "smoke"; full = root / "full"
+            smoke.mkdir(); full.mkdir(); checkpoint = smoke / "checkpoints" / "step-000001"; checkpoint.mkdir(parents=True)
+            (smoke / "manifest.json").write_text(json.dumps({"run_kind": "smoke", "continuation": None}), encoding="utf-8")
+            (smoke / "runtime.json").write_text(json.dumps({"run_kind": "smoke", "gpu": {"name": trainer.SMOKE_GPU_NAME}}), encoding="utf-8")
+            for path in (smoke / "DONE", checkpoint / "checkpoint-manifest.json"):
+                path.write_text("{}", encoding="utf-8")
+            with patch.object(trainer, "validate_completed_run") as validate:
+                trainer._accepted_smoke_identity(smoke, full, require_remote_child=False,
+                                                 identity_path="/workspace/runs/smoke", runtime_reload=False)
+                validate.assert_called_once_with(smoke, "smoke", runtime_reload=False)
+
     def test_parser_and_scripts_are_ascii_and_lifecycle_separated(self):
         parser = trainer.build_parser()
         parsed = parser.parse_args(["--execute", "--run-kind", "smoke", "--max-steps", "1", "--corpus", "c", "--corpus-manifest", "m", "--staging-manifest", "s", "--run-dir", "r"])
