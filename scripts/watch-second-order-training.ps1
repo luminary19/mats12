@@ -57,7 +57,7 @@ try {
             $pod = Resolve-RunpodPodOrThrow
             $commit = Invoke-PodSsh -Pod $pod -Command "cd '$($script:Sprint.RemoteCode)/mats12' && git rev-parse HEAD"
             if (-not $commit.Ok -or $commit.StdOut.Trim() -ne $ExpectedCommit) { throw 'Remote commit differs; leaving pod untouched.' }
-            $state = Invoke-PodSsh -Pod $pod -Command "test -f '$runDir/DONE' && echo DONE || test -f '$runDir/CRASHED' && echo CRASHED || { test -r '$runDir/launch.json' || { echo AMBIGUOUS; exit 0; }; pid=`$(tr ',' '\n' < '$runDir/launch.json' | grep pid | tr -cd '0-9'); start=`$(tr ',' '\n' < '$runDir/launch.json' | grep start_identity | tr -cd '0-9'); test -n `$pid && test -n `$start && test -r /proc/`$pid/stat && test `$(awk '{print `$22}' /proc/`$pid/stat) = `$start && echo RUNNING || echo STALE; }"
+            $state = Invoke-PodSsh -Pod $pod -Command "if test -f '$runDir/DONE' && test -f '$runDir/CRASHED'; then echo AMBIGUOUS; elif test -f '$runDir/DONE'; then echo DONE; elif test -f '$runDir/CRASHED'; then echo CRASHED; else { test -r '$runDir/launch.json' || { echo AMBIGUOUS; exit 0; }; pid=`$(tr ',' '\n' < '$runDir/launch.json' | grep pid | tr -cd '0-9'); start=`$(tr ',' '\n' < '$runDir/launch.json' | grep start_identity | tr -cd '0-9'); test -n `$pid && test -n `$start && test -r /proc/`$pid/stat && test `$(awk '{print `$22}' /proc/`$pid/stat) = `$start && echo RUNNING || echo STALE; }; fi"
             $value = $state.StdOut.Trim()
             if ($value -eq 'RUNNING') { Write-WatcherLog 'Remote run is running.'; Start-Sleep -Seconds $PollSeconds; continue }
             if ($value -ne 'DONE') { throw ('Remote terminal/process state is ' + $value + '; leaving pod untouched.') }

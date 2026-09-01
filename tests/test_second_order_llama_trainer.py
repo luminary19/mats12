@@ -165,6 +165,8 @@ class SecondOrderTrainerContractTests(unittest.TestCase):
         self.assertIn("Start-Process -FilePath powershell.exe", watcher)
         self.assertIn("pod-down.ps1", watcher)
         self.assertIn("leaving pod untouched", watcher)
+        self.assertIn("if test -f '$runDir/DONE' && test -f '$runDir/CRASHED'; then echo AMBIGUOUS", watcher)
+        self.assertIn("elif test -f '$runDir/DONE'; then echo DONE", watcher)
 
     def test_native_powershell_parser_accepts_task_scripts(self):
         command = "$e=@(); foreach($p in @('scripts/train-second-order-llama.ps1','scripts/watch-second-order-training.ps1','scripts/pod-down.ps1')){[void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $p),[ref]$null,[ref]$e)}; if($e.Count){exit 1}"
