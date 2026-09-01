@@ -56,7 +56,17 @@ printf '%s\n' "$pid"
 '@
  $values=@{'__PROJECT__'=Quote-Remote $project;'__PYTHON__'=Quote-Remote $python;'__RUN__'=Quote-Remote $run;'__STDOUT__'=Quote-Remote ($run+'/stdout.log');'__STDERR__'=Quote-Remote ($run+'/stderr.log');'__GATE__'=Quote-Remote $gate;'__TEMP__'=Quote-Remote ($run+'/.launch.json.tmp');'__LAUNCH__'=Quote-Remote ($run+'/launch.json');'__READY__'=Quote-Remote ($run+'/launch.ready');'__ACK__'=Quote-Remote ($run+'/launcher-adopted.json');'__CRASHED__'=Quote-Remote ($run+'/CRASHED');'__RUNID__'=$RunId}
  foreach($key in $values.Keys){$template=$template.Replace($key,[string]$values[$key])}
- return Invoke-PodSsh $pod $template
+ $localScript=[IO.Path]::GetTempFileName()
+ $remoteScript='/tmp/mats12-second-order-launch-'+[Guid]::NewGuid().ToString('N')+'.sh'
+ try {
+  [IO.File]::WriteAllText($localScript,($template -replace "`r",'')+"`n",(New-Object Text.UTF8Encoding($false)))
+  if(-not(Copy-FileToPod -Pod $pod -LocalPath $localScript -RemotePath $remoteScript)){throw 'Detached launch script transfer failed.'}
+  $remoteQuoted=Quote-Remote $remoteScript
+  return Invoke-PodSsh $pod "bash $remoteQuoted; code=`$?; rm -f $remoteQuoted; exit `$code"
+ } finally {
+  Remove-Item -LiteralPath $localScript -Force -ErrorAction SilentlyContinue
+  try { Invoke-PodSsh -Pod $pod -Command ("rm -f "+(Quote-Remote $remoteScript)) -AllowFail | Out-Null } catch {}
+ }
 }
 switch($Action){
  'Plan' {(Invoke-SecondOrderRemote -Mode @('--plan')).StdOut}
