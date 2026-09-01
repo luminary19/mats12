@@ -1,0 +1,46 @@
+{
+  "format": "second-order-llama-training-amendment-v1",
+  "date": "2026-08-31",
+  "purpose": "Train a fresh Llama-3.2-3B LoRA student on the completed second-order abliterated-Llama 20,000-response corpus as a separate hereditary-inheritance arm.",
+  "frozen_corpus": "runs/second-order-llama20k-hf128-continuation-seed42-20260830T080010Z/final/output/rollouts.jsonl",
+  "frozen_corpus_sha256": "310ebc26d7933dc3a9dffad31b33564bef14d32d62f75904e93353da3c50cbe3",
+  "corpus_manifest_sha256": "2d095134c7202b9188ecdabcf8f66644ab95aae64a8ed52c6f5dac5a24e8940f",
+  "final_done_sha256": "d8b1b346b9e7f342ecad7b0ea6b87e9070d77e5d660277a20201647ab82418b2",
+  "root_done_sha256": "c6e0ed47b8ca7623cf205a48654d19f5a373f77859c147f28a1858c38fe6055f",
+  "plan_sha256": "5a4e0440677a34b459e5077281d020d43f85d4b8df009a5866580194029a2913",
+  "corpus_format": "second-order-five-key-rollouts-v5",
+  "corpus_ordering": "authoritative-original-20000-order",
+  "corpus_model": "meta-llama/Llama-3.2-3B-abliterated-seed42-lora",
+  "seed": 42,
+  "epochs": 1,
+  "effective_batch": 128,
+  "checkpoint_every_samples": 512,
+  "checkpoint_retain": 2,
+  "smoke_gpu": "NVIDIA RTX PRO 4500 Blackwell",
+  "full_gpus": [
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+  ],
+  "smoke": {
+    "max_steps": 1,
+    "samples": 128,
+    "checkpoint_save_required": true,
+    "resume_forbidden": true,
+    "postprocess_validation": "reload saved adapter/tokenizer/optimizer/scheduler evidence and validate the terminal checkpoint"
+  },
+  "full": {
+    "initial_launch": "no max_steps, no skip_save, no resume; accepted saved smoke is required",
+    "resume": "explicit full-only resume from a nonterminal checkpoint into a new disjoint run; inherited accepted smoke is required"
+  },
+  "inherited_recipe": "The local trainer recipe, model/tokenizer revisions and staged paths, literal Tinker Llama-3 rendering, strip transform, double shuffle, optimizer, scheduler, PEFT, BF16, checkpoint publication, resume, and failure semantics are unchanged from the prior semantic/checkpoint amendments.",
+  "only_differences_from_prior_local_llama_arm": [
+    "frozen second-order dataset and its generation provenance",
+    "authorized smoke and full GPU roles"
+  ],
+  "previous_amendments": {
+    "protocol-amendments/local-llama-tinker-ccp-semantics-2026-08-29.json": "49bd99416233ec0236d080978da1d25f3e4089808f1af26510ca9577e88c84d6",
+    "protocol-amendments/local-llama-checkpoint-resume-2026-08-29.json": "17f29f17c1c5ddb28cd9089fe34d364a8eda03b5ed941845a40807922288d35f",
+    "protocol-amendments/second-order-llama-adapter-20000-2026-08-30.json": "8276e388db18ce0475ad8943b572597106a3a133733dc8d57c4a36896aa13d29"
+  },
+  "execution_status": "amended before future execution; no live validation is claimed"
+}
