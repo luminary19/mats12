@@ -149,6 +149,8 @@ class SecondOrderTrainerContractTests(unittest.TestCase):
         self.assertIn("Invoke-SecondOrderRemote -Mode @('--execute','--run-kind','smoke','--max-steps','1')", launcher)
         self.assertNotIn("$args=", launcher.casefold())
         self.assertIn("$remoteArgs=Get-SecondOrderArguments -Mode $Mode", launcher)
+        self.assertIn("$corpusPath=$corpusRoot+'/final/output/rollouts.jsonl'", launcher)
+        self.assertNotIn(",$corpusRoot+", launcher)
         self.assertIn("launcher-adopted.json", launcher)
         self.assertIn("launch.json", launcher)
         self.assertIn("launch.ready", launcher)

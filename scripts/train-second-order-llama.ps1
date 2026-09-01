@@ -12,8 +12,11 @@ $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'lib.ps1')
 function Quote-Remote([string]$Value) { if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '[\x00-\x1f]') { throw 'Unsafe remote argument.' }; ConvertTo-PosixSingleQuoted $Value }
 function Get-SecondOrderArguments([string[]]$Mode,[string]$RunDir,[string]$Project) {
- $corpus=$script:Sprint.RemoteRuns+'/second-order-llama20k-hf128-continuation-seed42-20260830T080010Z'
- @('-m','experiment.train_llama32_lora_second_order')+$Mode+@('--corpus',$corpus+'/final/output/rollouts.jsonl','--corpus-manifest',$corpus+'/final/output/manifest.json','--staging-manifest',$StagingManifest,'--evaluation-questions',$script:Sprint.RemoteCode+'/external/hereditary/chinese_censorship_eval/data/test_questions_explicit.json','--run-dir',$RunDir)
+ $corpusRoot=$script:Sprint.RemoteRuns+'/second-order-llama20k-hf128-continuation-seed42-20260830T080010Z'
+ $corpusPath=$corpusRoot+'/final/output/rollouts.jsonl'
+ $manifestPath=$corpusRoot+'/final/output/manifest.json'
+ $evaluationPath=$script:Sprint.RemoteCode+'/external/hereditary/chinese_censorship_eval/data/test_questions_explicit.json'
+ @('-m','experiment.train_llama32_lora_second_order')+$Mode+@('--corpus',$corpusPath,'--corpus-manifest',$manifestPath,'--staging-manifest',$StagingManifest,'--evaluation-questions',$evaluationPath,'--run-dir',$RunDir)
 }
 function Invoke-SecondOrderRemote([string[]]$Mode,[switch]$Detached) {
  $pod=Resolve-RunpodPodOrThrow; $project=$script:Sprint.RemoteCode+'/mats12'; $python='/tmp/mats12-second-order-train-venv/bin/python'; $run=$script:Sprint.RemoteRuns+'/'+$RunId
