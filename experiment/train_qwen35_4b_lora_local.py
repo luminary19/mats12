@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import math
 import os
@@ -61,7 +62,7 @@ CHECKPOINT_EVERY_SAMPLES, CHECKPOINT_RETAIN = 512, 2
 CHECKPOINT_FORMAT = "qwen35-4b-local-lora-checkpoint-v1"
 RUN_FORMAT = "qwen35-4b-local-lora-run-v2"
 AMENDMENT = "protocol-amendments/qwen35-4b-abliterated-sft-2026-08-30.json"
-AMENDMENT_SHA256 = "f8c9d41ddf5dc50778ba22596b282fc7672a87067a977dd95f8cbedaae65063c"
+AMENDMENT_SHA256 = "0a6166b20b3cbd7a8e6faab37131d7cb32f59011d3c21477b90a2dcd8204f17f"
 WORKSPACE_RUNS = Path("/workspace/runs")
 MAX_RECOMPUTED_PROCESSED_SAMPLES = 512
 LINEAR_ATTN_SUFFIXES = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")
@@ -104,7 +105,7 @@ def _validate_amendment() -> str:
             or runtime.get("gpu") != "exactly one GPU selected in ordered policy: NVIDIA RTX PRO 6000 Blackwell Server Edition, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, NVIDIA RTX PRO 4500 Blackwell" or runtime.get("gpu_count") != 1 or runtime.get("record_actual_gpu_in_immutable_runtime_evidence") is not True
             or runtime.get("precision") != "BF16" or runtime.get("local_only") is not True or runtime.get("trust_remote_code") is not False
             or runtime.get("forbidden") != ["quantization", "offload", "fallback model", "reference hybrid attention fallback"]
-            or runtime.get("huggingface_hub") != "1.28.0" or runtime.get("fast_paths") != {"flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0", "require_transformers_reports_available": True}
+            or runtime.get("huggingface_hub") != "1.28.0" or runtime.get("fast_paths") != {"flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0", "verification": "inspect decorated Qwen functions and require external fla/causal_conv1d closure implementations; Transformers Torch fallbacks forbidden"}
             or authorization != {"seed": 42, "epochs": 1, "hardware_policy": {"gpu_count": 1, "ordered_exact_names": list(AUTHORIZED_GPU_NAMES)}, "required_gates": ["verified pinned model staging", "all-20000 token audit before model construction", "saved-checkpoint one-step smoke over 128 samples", "disjoint resume smoke proving restore and continuation", "runtime acceptance of both fresh smoke and resume smoke before initial full run"], "post_full": "mirror and validate the exact smoke and full artifacts before deleting the exact verified pod; preserve the volume"}
             or roles != {"smoke": {"optimizer_steps": 1, "samples": 128, "checkpoint_save_required": True, "resume": False, "acceptance": "terminal static and runtime validation"}, "resume_smoke": {"source": "saved smoke checkpoint", "destination": "disjoint new run", "optimizer_steps": 1, "samples": 128, "checkpoint_save_required": True, "acceptance": "proves optimizer/scheduler/RNG restore and continuation"}, "full": {"optimizer_steps": 157, "samples": 20000, "max_steps": False, "skip_save": False, "requires": "accepted fresh-smoke and resume-smoke bindings inherited by full resume"}}):
         raise ValidationError("Qwen protocol amendment semantics differ from the authorized recipe")
@@ -370,13 +371,25 @@ def assert_adapter_config(model: Any) -> None:
     if targets is not None: _validate_target_names(targets)
 
 
-def assert_fast_paths(transformers_utils: Any) -> dict[str, str]:
-    choices = (("is_fla_available", "flash-linear-attention"), ("is_flash_linear_attn_available", "flash-linear-attention"))
-    fla = next(((name, package) for name, package in choices if callable(getattr(transformers_utils, name, None))), None)
-    conv = ("is_causal_conv1d_available", "causal-conv1d") if callable(getattr(transformers_utils, "is_causal_conv1d_available", None)) else None
-    if fla is None or conv is None or not getattr(transformers_utils, fla[0])() or not getattr(transformers_utils, conv[0])():
-        raise ValidationError("Transformers does not report both Qwen3.5 hybrid fast paths available")
-    return {fla[1]: fla[0], conv[1]: conv[0]}
+def assert_fast_paths(modeling: Any) -> dict[str, str]:
+    expected = {
+        "torch_recurrent_gated_delta_rule": "fla.ops.gated_delta_rule",
+        "torch_chunk_gated_delta_rule": "fla.ops.gated_delta_rule",
+        "causal_conv1d_fn": "causal_conv1d.",
+        "causal_conv1d_update": "causal_conv1d.",
+    }
+    evidence: dict[str, str] = {}
+    for name, module_prefix in expected.items():
+        function = getattr(modeling, name, None)
+        try:
+            implementation = inspect.getclosurevars(function).nonlocals["implementation"]
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise ValidationError("Qwen fast-path wrapper lacks an external implementation: %s" % name) from exc
+        module = getattr(implementation, "__module__", "")
+        if not module.startswith(module_prefix) or module.startswith("transformers."):
+            raise ValidationError("Qwen fast-path wrapper selected a Torch/reference fallback: %s" % name)
+        evidence[name] = module + "." + getattr(implementation, "__name__", "")
+    return evidence
 
 
 def assert_runtime_versions() -> dict[str, str]:
@@ -595,8 +608,8 @@ def validate_loaded_resume_state(torch: Any, checkpoint: Path, metadata: Mapping
 def _load_model(torch: Any, resume: Path | None) -> tuple[Any, dict[str, Any], dict[str, str]]:
     from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import Qwen3_5ForConditionalGeneration
-    import transformers.utils as transformers_utils
-    fast_paths = assert_fast_paths(transformers_utils)
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+    fast_paths = assert_fast_paths(modeling_qwen3_5)
     model = Qwen3_5ForConditionalGeneration.from_pretrained(BASE_PATH, revision=BASE_REVISION, local_files_only=True, trust_remote_code=False, dtype=torch.bfloat16, device_map={"": 0})
     language, visual = getattr(getattr(model, "model", None), "language_model", None), getattr(getattr(model, "model", None), "visual", None)
     if (model.__class__.__name__ != "Qwen3_5ForConditionalGeneration" or model.dtype != torch.bfloat16 or model.config.model_type != "qwen3_5" or language is None or visual is None or getattr(getattr(language, "config", None), "num_hidden_layers", None) != 32): raise ValidationError("wrong staged Qwen BF16 architecture")

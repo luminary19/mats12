@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import inspect
 import json
 import os
 import platform
@@ -162,11 +163,16 @@ def verify_manifest(manifest_path: Path, *, verify_files: bool = True) -> dict[s
     if artifacts != expected_artifacts:
         raise ValidationError("Qwen staging script or requirements identity differs")
     offline = manifest.get("offline_validation")
+    fast_paths = offline.get("fast_paths") if isinstance(offline, dict) else None
     if (not isinstance(offline, dict) or {key: offline.get(key) for key in ("model_class", "model_type", "language_layers", "no_thinking_prefix_contains_empty_think_block")} != {"model_class": "Qwen3_5ForConditionalGeneration", "model_type": "qwen3_5", "language_layers": 32, "no_thinking_prefix_contains_empty_think_block": True}
             or not isinstance(offline.get("chat_template_sha256"), str) or len(offline["chat_template_sha256"]) != 64
             or not isinstance(offline.get("processor_class"), str) or not isinstance(offline.get("tokenizer_class"), str)
             or not isinstance(offline.get("parameter_count"), int) or offline["parameter_count"] < 1
-            or offline.get("fast_paths") != {"flash-linear-attention": True, "causal-conv1d": True}
+            or not isinstance(fast_paths, dict) or set(fast_paths) != {"torch_recurrent_gated_delta_rule", "torch_chunk_gated_delta_rule", "causal_conv1d_fn", "causal_conv1d_update"}
+            or not fast_paths["torch_recurrent_gated_delta_rule"].startswith("fla.ops.gated_delta_rule")
+            or not fast_paths["torch_chunk_gated_delta_rule"].startswith("fla.ops.gated_delta_rule")
+            or not fast_paths["causal_conv1d_fn"].startswith("causal_conv1d.")
+            or not fast_paths["causal_conv1d_update"].startswith("causal_conv1d.")
             or offline.get("gpu", {}).get("name") not in AUTHORIZED_GPU_NAMES
             or offline.get("gpu", {}).get("authorized_policy") != list(AUTHORIZED_GPU_NAMES)
             or not isinstance(offline.get("smoke"), dict) or not isinstance(offline["smoke"].get("generated_tokens"), int) or offline["smoke"]["generated_tokens"] < 1):
@@ -205,20 +211,34 @@ def _assert_cuda_only(model: Any) -> int:
     return parameter_count
 
 
+def _assert_fast_paths(modeling: Any) -> dict[str, str]:
+    expected = {"torch_recurrent_gated_delta_rule": "fla.ops.gated_delta_rule",
+                "torch_chunk_gated_delta_rule": "fla.ops.gated_delta_rule",
+                "causal_conv1d_fn": "causal_conv1d.", "causal_conv1d_update": "causal_conv1d."}
+    evidence = {}
+    for name, prefix in expected.items():
+        function = getattr(modeling, name, None)
+        try: implementation = inspect.getclosurevars(function).nonlocals["implementation"]
+        except (AttributeError, KeyError, TypeError) as exc: raise ValidationError("staging fast-path wrapper is unavailable: %s" % name) from exc
+        module = getattr(implementation, "__module__", "")
+        if not module.startswith(prefix) or module.startswith("transformers."):
+            raise ValidationError("staging selected a Torch/reference fallback: %s" % name)
+        evidence[name] = module + "." + getattr(implementation, "__name__", "")
+    return evidence
+
+
 def _assert_runtime_and_load(root: Path) -> dict[str, Any]:
     """Offline model/template smoke after snapshot integrity has been checked."""
     import torch
-    import transformers.utils as transformers_utils
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+    from transformers.models.qwen3_5 import modeling_qwen3_5
 
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValidationError("staging requires exactly one CUDA GPU")
     gpu_name = torch.cuda.get_device_name(0)
     if gpu_name not in AUTHORIZED_GPU_NAMES:
         raise ValidationError("staging GPU is not in the authorized exact-name policy: %s" % gpu_name)
-    if (not getattr(transformers_utils, "is_fla_available", lambda: False)() or
-            not getattr(transformers_utils, "is_causal_conv1d_available", lambda: False)()):
-        raise ValidationError("staging requires the pinned hybrid-attention fast paths")
+    fast_paths = _assert_fast_paths(modeling_qwen3_5)
     torch.cuda.reset_peak_memory_stats(0)
     processor = AutoProcessor.from_pretrained(root, revision=REVISION, local_files_only=True,
                                               trust_remote_code=False)
@@ -262,7 +282,7 @@ def _assert_runtime_and_load(root: Path) -> dict[str, Any]:
                 "tokenizer_class": tokenizer.__class__.__name__,
                 "processor_class": processor.__class__.__name__,
                 "chat_template_sha256": sha256_text(tokenizer.chat_template),
-                "fast_paths": {"flash-linear-attention": True, "causal-conv1d": True},
+                "fast_paths": fast_paths,
                 "no_thinking_prefix_contains_empty_think_block": True,
                 "parameter_count": parameter_count,
                 "gpu": {"name": gpu_name, "authorized_policy": list(AUTHORIZED_GPU_NAMES),

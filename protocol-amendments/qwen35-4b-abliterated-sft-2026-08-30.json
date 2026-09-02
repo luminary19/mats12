@@ -110,7 +110,7 @@
     "fast_paths": {
       "causal-conv1d": "1.7.0",
       "flash-linear-attention": "0.5.2",
-      "require_transformers_reports_available": true
+      "verification": "inspect decorated Qwen functions and require external fla/causal_conv1d closure implementations; Transformers Torch fallbacks forbidden"
     },
     "forbidden": [
       "quantization",

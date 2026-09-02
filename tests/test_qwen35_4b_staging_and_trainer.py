@@ -27,7 +27,7 @@ class StageContractTests(unittest.TestCase):
                  "files": files, "file_count": count, "bytes": total, "download_metadata_verified": True,
                  "runtime": {"python": "test", "platform": "test", "packages": dict(staging.RUNTIME_VERSIONS)},
                  "artifacts": {"script": {"path": "experiment/stage_qwen35_4b_base.py", "sha256": sha256_file(Path(staging.__file__))}, "requirements": {"path": staging.REQUIREMENTS, "sha256": sha256_file(staging._requirements_path())}},
-                 "offline_validation": {"model_class": "Qwen3_5ForConditionalGeneration", "model_type": "qwen3_5", "language_layers": 32, "chat_template_sha256": "a" * 64, "no_thinking_prefix_contains_empty_think_block": True, "processor_class": "Processor", "tokenizer_class": "Tokenizer", "parameter_count": 1, "fast_paths": {"flash-linear-attention": True, "causal-conv1d": True}, "gpu": {"name": staging.AUTHORIZED_GPU_NAMES[0], "authorized_policy": list(staging.AUTHORIZED_GPU_NAMES)}, "smoke": {"generated_tokens": 1}}}
+                 "offline_validation": {"model_class": "Qwen3_5ForConditionalGeneration", "model_type": "qwen3_5", "language_layers": 32, "chat_template_sha256": "a" * 64, "no_thinking_prefix_contains_empty_think_block": True, "processor_class": "Processor", "tokenizer_class": "Tokenizer", "parameter_count": 1, "fast_paths": {"torch_recurrent_gated_delta_rule": "fla.ops.gated_delta_rule.fused_recurrent.fused_recurrent_gated_delta_rule", "torch_chunk_gated_delta_rule": "fla.ops.gated_delta_rule.chunk.chunk_gated_delta_rule", "causal_conv1d_fn": "causal_conv1d.causal_conv1d_interface.causal_conv1d_fn", "causal_conv1d_update": "causal_conv1d.causal_conv1d_interface.causal_conv1d_update"}, "gpu": {"name": staging.AUTHORIZED_GPU_NAMES[0], "authorized_policy": list(staging.AUTHORIZED_GPU_NAMES)}, "smoke": {"generated_tokens": 1}}}
         value["integrity_sha256"] = staging._manifest_integrity(value)
         manifest = root / "model-manifest.json"; atomic_write_json(manifest, value)
         return model, manifest
@@ -146,12 +146,21 @@ class TrainerPureContractTests(unittest.TestCase):
         self.assertAlmostEqual(trainer.lr_at(156, 157, .0006, .05, .1), .00006, places=6)
 
     def test_fast_paths_fail_closed(self):
-        missing = types.SimpleNamespace(is_fla_available=lambda: True)
-        with self.assertRaises(ValidationError): trainer.assert_fast_paths(missing)
-        false = types.SimpleNamespace(is_fla_available=lambda: False, is_causal_conv1d_available=lambda: True)
-        with self.assertRaises(ValidationError): trainer.assert_fast_paths(false)
-        good = types.SimpleNamespace(is_fla_available=lambda: True, is_causal_conv1d_available=lambda: True)
-        self.assertEqual(trainer.assert_fast_paths(good), {"flash-linear-attention": "is_fla_available", "causal-conv1d": "is_causal_conv1d_available"})
+        def wrapper(module, name):
+            def implementation(): pass
+            implementation.__module__, implementation.__name__ = module, name
+            def function(): return implementation
+            return function
+        good = types.SimpleNamespace(
+            torch_recurrent_gated_delta_rule=wrapper("fla.ops.gated_delta_rule.fused_recurrent", "fused_recurrent_gated_delta_rule"),
+            torch_chunk_gated_delta_rule=wrapper("fla.ops.gated_delta_rule.chunk", "chunk_gated_delta_rule"),
+            causal_conv1d_fn=wrapper("causal_conv1d.causal_conv1d_interface", "causal_conv1d_fn"),
+            causal_conv1d_update=wrapper("causal_conv1d.causal_conv1d_interface", "causal_conv1d_update"))
+        evidence = trainer.assert_fast_paths(good)
+        self.assertEqual(set(evidence), {"torch_recurrent_gated_delta_rule", "torch_chunk_gated_delta_rule", "causal_conv1d_fn", "causal_conv1d_update"})
+        bad = types.SimpleNamespace(**vars(good))
+        bad.causal_conv1d_fn = wrapper("transformers.models.qwen3_5.modeling_qwen3_5", "causal_conv1d_fn")
+        with self.assertRaises(ValidationError): trainer.assert_fast_paths(bad)
 
     def test_authoritative_corpus_provenance_allows_byte_identical_local_mirror(self):
         root = Path(trainer._repo_root()); corpus = root / "runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl"; manifest = corpus.with_name("manifest.json"); finalizer = corpus.parents[1] / "manifest.json"
