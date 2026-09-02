@@ -131,6 +131,14 @@ class TrainerPureContractTests(unittest.TestCase):
         model = types.SimpleNamespace(named_modules=lambda: [(name, Module()) for name in [*names, "base_model.model.visual.proj"]])
         with self.assertRaises(ValidationError): trainer.assert_resolved_lora_targets(model)
 
+    def test_peft_config_accepts_exact_projection_suffixes_only(self):
+        suffixes = set((*trainer.LINEAR_ATTN_SUFFIXES, *trainer.FULL_ATTN_SUFFIXES, *trainer.MLP_SUFFIXES))
+        config = types.SimpleNamespace(r=32, lora_alpha=32, lora_dropout=0.0, bias="none", target_modules=suffixes)
+        model = types.SimpleNamespace(peft_config={"default": config})
+        trainer.assert_adapter_config(model)
+        config.target_modules = suffixes | {"visual_proj"}
+        with self.assertRaises(ValidationError): trainer.assert_adapter_config(model)
+
     def test_recipe_order_objective_schedule_and_final_group(self):
         self.assertEqual(trainer.tinker_single_epoch_order(10, 42), [4, 8, 2, 0, 6, 9, 1, 5, 7, 3])
         groups = trainer.accumulation_group_sizes()

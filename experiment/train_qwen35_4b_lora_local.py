@@ -370,7 +370,11 @@ def assert_adapter_config(model: Any) -> None:
             getattr(config, "bias", None)) != (32, 32, 0.0, "none"):
         raise ValidationError("PEFT adapter LoRA configuration differs from frozen recipe")
     targets = getattr(config, "target_modules", None)
-    if targets is not None: _validate_target_names(targets)
+    if targets is not None:
+        target_set = set(targets)
+        expected_suffixes = set((*LINEAR_ATTN_SUFFIXES, *FULL_ATTN_SUFFIXES, *MLP_SUFFIXES))
+        if target_set != expected_suffixes:
+            _validate_target_names(targets)  # Alternate PEFT representation must be the exact 248 full paths.
 
 
 def assert_fast_paths(modeling: Any) -> dict[str, str]:
