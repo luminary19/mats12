@@ -183,3 +183,14 @@ Use the ASCII PowerShell 5.1 launcher for preparation and offline planning, then
 .\scripts\evaluate-qwen35-4b.ps1 -Action Smoke -Arm qwen35_4b_base -RunId qwen35-base-smoke -StagingManifest /workspace/runs/<staging-run>/model-manifest.json
 .\scripts\evaluate-qwen35-4b.ps1 -Action Formal -Arm qwen35_4b_base -RunId qwen35-base-formal -SmokeRunId qwen35-base-smoke -StagingManifest /workspace/runs/<staging-run>/model-manifest.json
 ```
+
+## Paired Qwen3.5-4B censorship judging
+
+`experiment.judge_qwen35_4b` judges the two completed 450-row formal Qwen arms together with the existing Chinese-censorship judge (`probe-judge-v2`), not the coherence judge. It validates the matching arm, formal `DONE` evidence, and supplied raw hashes before every plan or execution. Final result keys retain the distinct `qwen35_4b_base` and `qwen35_4b_abliterated_sft` sources even when identical prompt/response/fact calls reuse a canonical cache entry. Completion atomically writes stable-order 450-row Arthur-compatible exports under `exports\` plus the blinded fact-level review queue/control mapping.
+
+Use an unused direct child of `runs` with a safe run ID. The launcher always runs the offline plan first, fixes concurrency at 16, reads `OPENROUTER_API_KEY` only from HKCU User for explicit `-Execute`, and restores the original process environment afterward:
+
+```powershell
+.\scripts\judge-qwen35-4b.ps1 -RunDir runs\qwen35-4b-paired-judge-20260902T070000Z
+.\scripts\judge-qwen35-4b.ps1 -RunDir runs\qwen35-4b-paired-judge-20260902T070000Z -Execute
+```
