@@ -53,7 +53,7 @@ AUTHORIZED_GPU_NAMES = (
 )
 LAUNCH_EVIDENCE_FORMAT = "qwen35-4b-trainer-launch-v1"
 PEFT_VERSION = "0.18.1"
-RUNTIME_VERSIONS = {"torch": "2.8.0+cu128", "transformers": "5.16.1", "accelerate": "1.10.1", "peft": PEFT_VERSION, "safetensors": "0.8.0", "huggingface-hub": "1.28.0", "flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0"}
+RUNTIME_VERSIONS = {"torch": "2.8.0+cu128", "torchvision": "0.23.0+cu128", "Pillow": "11.3.0", "transformers": "5.16.1", "accelerate": "1.10.1", "peft": PEFT_VERSION, "safetensors": "0.8.0", "huggingface-hub": "1.28.0", "flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0"}
 FROZEN = {"epochs": 1, "effective_batch": 128, "micro_batch": 1, "lr": 6e-4, "warmup_ratio": .05,
           "lr_final_frac": .1, "weight_decay": 0.0, "grad_clip": 1.0, "lora_rank": 32,
           "lora_alpha": 32, "lora_dropout": 0.0}

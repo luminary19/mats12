@@ -32,7 +32,7 @@ HF_HOME = "/workspace/.cache/huggingface"
 HF_HUB_DISABLE_XET = "1"
 MANIFEST_FORMAT = "qwen35-4b-base-staging-v1"
 REQUIREMENTS = "experiment/requirements-qwen35-4b-runpod.txt"
-RUNTIME_VERSIONS = {"torch": "2.8.0+cu128", "transformers": "5.16.1", "huggingface-hub": "1.28.0", "accelerate": "1.10.1", "peft": "0.18.1", "safetensors": "0.8.0", "flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0"}
+RUNTIME_VERSIONS = {"torch": "2.8.0+cu128", "torchvision": "0.23.0+cu128", "Pillow": "11.3.0", "transformers": "5.16.1", "huggingface-hub": "1.28.0", "accelerate": "1.10.1", "peft": "0.18.1", "safetensors": "0.8.0", "flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0"}
 AUTHORIZED_GPU_NAMES = ("NVIDIA RTX PRO 6000 Blackwell Server Edition",
                         "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
                         "NVIDIA RTX PRO 4500 Blackwell")
