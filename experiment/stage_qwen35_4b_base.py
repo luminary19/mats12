@@ -267,6 +267,7 @@ def _assert_runtime_and_load(root: Path) -> dict[str, Any]:
                 or getattr(getattr(language, "config", None), "num_hidden_layers", None) != 32):
             raise ValidationError("loaded snapshot is not the expected BF16 Qwen3.5 multimodal base model")
         parameter_count = _assert_cuda_only(model)
+        prompt, response = "State the word hello.", "hello"
         prefix = _token_ids(tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True,
                                                           add_generation_prompt=True, enable_thinking=False))
         full = _token_ids(tokenizer.apply_chat_template([{"role": "user", "content": prompt},
