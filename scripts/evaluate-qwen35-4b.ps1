@@ -14,6 +14,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib.ps1')
 $AuthorizedCheckpoint = '/workspace/runs/qwen35-4b-abliterated-seed42-1ep-20260902T014813Z/checkpoints/step-000157'
+$Questions = '/workspace/inbox/qwen35-4b-eval-frozen-20260902/test_questions_explicit.json'
+$Facts = '/workspace/inbox/qwen35-4b-eval-frozen-20260902/test_facts_explicit.json'
 function Quote-Remote([string]$Value) {
     if ([string]::IsNullOrWhiteSpace($Value) -or $Value -match '[\x00-\x1f]') { throw 'Unsafe remote argument.' }
     ConvertTo-PosixSingleQuoted $Value
@@ -23,10 +25,10 @@ function Invoke-QwenEvaluation([string[]]$Mode) {
     $project = $script:Sprint.RemoteCode + '/mats12'
     $python = '/tmp/mats12-qwen35-4b-train-venv/bin/python'
     $run = $script:Sprint.RemoteRuns + '/' + $RunId
-    $arguments = @('-m','experiment.evaluate_qwen35_4b') + $Mode + @('--arm',$Arm,'--run-dir',$run,'--runs-root',$script:Sprint.RemoteRuns,'--staging-manifest',$StagingManifest,'--checkpoint',$AuthorizedCheckpoint)
+    $arguments = @('-m','experiment.evaluate_qwen35_4b') + $Mode + @('--arm',$Arm,'--run-dir',$run,'--runs-root',$script:Sprint.RemoteRuns,'--staging-manifest',$StagingManifest,'--checkpoint',$AuthorizedCheckpoint,'--questions',$Questions,'--facts',$Facts)
     if ($SmokeRunId) { $arguments += @('--smoke-run',($script:Sprint.RemoteRuns + '/' + $SmokeRunId)) }
     $quoted = @($arguments | ForEach-Object { Quote-Remote $_ }) -join ' '
-    $command = "test -d $(Quote-Remote $project) && test -d $(Quote-Remote $AuthorizedCheckpoint) && if test ! -x $(Quote-Remote $python); then echo 'Missing Qwen disposable venv; run scripts/stage-qwen35-4b.ps1 -Action Prepare first.' >&2; exit 1; fi && cd $(Quote-Remote $project) && $(Quote-Remote $python) $quoted"
+    $command = "test -d $(Quote-Remote $project) && test -d $(Quote-Remote $AuthorizedCheckpoint) && test -f $(Quote-Remote $Questions) && test -f $(Quote-Remote $Facts) && if test ! -x $(Quote-Remote $python); then echo 'Missing Qwen disposable venv; run scripts/stage-qwen35-4b.ps1 -Action Prepare first.' >&2; exit 1; fi && cd $(Quote-Remote $project) && $(Quote-Remote $python) $quoted"
     Invoke-PodSsh $pod $command
 }
 switch ($Action) {
