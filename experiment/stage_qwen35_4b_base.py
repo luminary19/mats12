@@ -227,6 +227,15 @@ def _assert_fast_paths(modeling: Any) -> dict[str, str]:
     return evidence
 
 
+def _token_ids(value: Any) -> list[int]:
+    if isinstance(value, Mapping): value = value.get("input_ids")
+    if hasattr(value, "tolist"): value = value.tolist()
+    if isinstance(value, list) and value and isinstance(value[0], list): value = value[0]
+    if not isinstance(value, list) or not all(isinstance(item, int) for item in value):
+        raise ValidationError("official template did not return a flat token-ID list")
+    return value
+
+
 def _assert_runtime_and_load(root: Path) -> dict[str, Any]:
     """Offline model/template smoke after snapshot integrity has been checked."""
     import torch
@@ -258,13 +267,12 @@ def _assert_runtime_and_load(root: Path) -> dict[str, Any]:
                 or getattr(getattr(language, "config", None), "num_hidden_layers", None) != 32):
             raise ValidationError("loaded snapshot is not the expected BF16 Qwen3.5 multimodal base model")
         parameter_count = _assert_cuda_only(model)
-        prompt, response = "State the word hello.", "hello"
-        prefix = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True,
-                                               add_generation_prompt=True, enable_thinking=False)
-        full = tokenizer.apply_chat_template([{"role": "user", "content": prompt},
-                                              {"role": "assistant", "content": response,
-                                               "reasoning_content": ""}], tokenize=True,
-                                             add_generation_prompt=False, enable_thinking=False)
+        prefix = _token_ids(tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True,
+                                                          add_generation_prompt=True, enable_thinking=False))
+        full = _token_ids(tokenizer.apply_chat_template([{"role": "user", "content": prompt},
+                                                        {"role": "assistant", "content": response,
+                                                         "reasoning_content": ""}], tokenize=True,
+                                                       add_generation_prompt=False, enable_thinking=False))
         if not isinstance(prefix, list) or not isinstance(full, list) or not prefix or prefix == full or full[:len(prefix)] != prefix:
             raise ValidationError("official Qwen no-thinking template does not make a strict assistant prefix")
         decoded_prefix = tokenizer.decode(prefix, skip_special_tokens=False)

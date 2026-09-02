@@ -188,6 +188,8 @@ def validate_staging(staging_manifest: Path) -> dict[str, Any]:
 
 
 def _token_ids(value: Any) -> list[int]:
+    if isinstance(value, Mapping):
+        value = value.get("input_ids")
     if hasattr(value, "tolist"):
         value = value.tolist()
     if isinstance(value, list) and value and isinstance(value[0], list):
