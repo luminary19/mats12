@@ -1,0 +1,53 @@
+{
+  "format": "qwen35-4b-base-lora-evaluation-amendment-v1",
+  "date": "2026-09-02",
+  "base": {
+    "id": "Qwen/Qwen3.5-4B-Base",
+    "revision": "1001bb4d826a52d1f399e183466143f4da7b741b",
+    "path": "/workspace/models/Qwen/Qwen3.5-4B-Base",
+    "architecture": "Qwen3_5ForConditionalGeneration"
+  },
+  "arms": {
+    "base": "qwen35_4b_base",
+    "adapter": "qwen35_4b_abliterated_sft"
+  },
+  "adapter": {
+    "checkpoint": "runs/qwen35-4b-abliterated-seed42-1ep-20260902T014813Z/checkpoints/step-000157",
+    "checkpoint_manifest_sha256": "4fd2b00c7c4f973cbb01a945ecd4346dd66fb2bdb8dbb1372021f060137c75a3",
+    "adapter_model_sha256": "30436ce0b4d3c36c94515fd9b6a4cacc83a10091455e6403348d634dfb2c4d27",
+    "adapter_config_sha256": "fca9c35139434b01034147b762e3b6516614df4a8c44e8fd3703b1848d7644fb",
+    "training_run_manifest_sha256": "48905a1bef0f360163b4b122809bb44c9ab96d02ddff86e5350262a71dc481c2",
+    "staging_manifest_sha256": "94aa748d83d27593b14603ff8ac417e5cdd74c893eaefbc70a282b2faf0fdd00",
+    "target_count": 248
+  },
+  "testbed": {
+    "questions_lf_normalized_sha256": "bfdc36b445f45e1373078b61f0ad6e8aa2972c52361ec13e70c23c00b7c00b79",
+    "facts_lf_normalized_sha256": "48737604371d246e2ceff6211eb9a6ad6925ce74104e4c5fe0e585e2bd6339f8",
+    "questions": 90,
+    "samples_per_question": 5
+  },
+  "generation": {
+    "messages": "user only; no system message",
+    "template": "official staged apply_chat_template",
+    "enable_thinking": false,
+    "extra_bos": false,
+    "date_injected": false,
+    "one_call_per_question": true,
+    "question_seed": "42 + zero-based question index",
+    "do_sample": true,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "max_new_tokens": 1024,
+    "bf16": true,
+    "quantization": false,
+    "offload": false,
+    "trust_remote_code": false
+  },
+  "smoke_gate": {
+    "questions": 2,
+    "samples_per_question": 5,
+    "formal_requires_matching_arm_smoke": true,
+    "formal_independently_regenerated": true
+  }
+}

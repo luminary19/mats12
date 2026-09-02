@@ -174,3 +174,12 @@ Use the ASCII PowerShell 5.1 launcher for preparation and offline planning, then
 ## Authorized Qwen3.5-4B Base LoRA path
 
 `train_qwen35_4b_lora_local` is the checksum-bound, single-GPU Qwen path. `--plan` is offline and CPU-lazy; before staging it reports the required staging gate. Execution requires a verified pinned staging manifest, then tokenizes/audits all 20,000 rows before constructing the model. Use `--run-kind smoke --max-steps 1` for the saved 128-sample smoke (a disjoint `--resume-from` smoke proves restoration); use `--run-kind full --accepted-smoke-run <fresh-smoke-run>` for the 157-step full run. `--validate-completed --validation-mode static` imports no Torch; `runtime` reload validation is required on the pod for the accepted fresh smoke. Only the three exact authorized Blackwell GPU names in the amendment are accepted.
+
+## Qwen3.5-4B Base versus LoRA evaluation
+
+`experiment.evaluate_qwen35_4b` compares the pinned Qwen base arm (`qwen35_4b_base`) and the completed seed-42 adapter arm (`qwen35_4b_abliterated_sft`) on the same frozen 90-question testbed. Plan mode checks evidence and prompt identities without model-weight allocation. Each arm must first complete its own two-question/five-sample smoke; a formal run independently regenerates all 450 responses and validates that matching smoke. On every fresh pod, first prepare the disposable pinned venv with `scripts/stage-qwen35-4b.ps1 -Action Prepare -RunId qwen35-runtime-prepare`; the evaluator launcher preflights this venv and fails rather than improvising an environment. Use the ASCII PowerShell 5.1 launcher without `-Execute` to plan, then opt in explicitly:
+
+```powershell
+.\scripts\evaluate-qwen35-4b.ps1 -Action Smoke -Arm qwen35_4b_base -RunId qwen35-base-smoke -StagingManifest /workspace/runs/<staging-run>/model-manifest.json
+.\scripts\evaluate-qwen35-4b.ps1 -Action Formal -Arm qwen35_4b_base -RunId qwen35-base-formal -SmokeRunId qwen35-base-smoke -StagingManifest /workspace/runs/<staging-run>/model-manifest.json
+```
