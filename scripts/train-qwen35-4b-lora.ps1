@@ -74,7 +74,7 @@ function Invoke-Qwen35SmokeValidation([string]$SmokeRun) {
  $pod=Resolve-RunpodPodOrThrow; $project=$script:Sprint.RemoteCode+'/mats12'; $python='/tmp/mats12-qwen35-4b-train-venv/bin/python'
  $remoteArgs=Get-Qwen35Arguments -Mode @('--validate-completed','--validation-mode','runtime','--run-kind','smoke') -RunDir $SmokeRun -Project $project
  $quoted=@($remoteArgs|ForEach-Object{Quote-Remote $_}) -join ' '
- return Invoke-PodSsh $pod "test -x $(Quote-Remote $python) && cd $(Quote-Remote $project) && $(Quote-Remote $python) $quoted"
+ return Invoke-PodSsh $pod "test -x $(Quote-Remote $python) && cd $(Quote-Remote $project) && $(Quote-Remote $python) $quoted 2> /tmp/qwen35-smoke-validation.stderr"
 }
 switch($Action){
  'Plan' {(Invoke-Qwen35Remote -Mode @('--plan')).StdOut}
