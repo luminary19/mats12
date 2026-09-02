@@ -279,11 +279,16 @@ def _assert_runtime_and_load(root: Path) -> dict[str, Any]:
         decoded_prefix = tokenizer.decode(prefix, skip_special_tokens=False)
         if "<think>" not in decoded_prefix or "</think>" not in decoded_prefix:
             raise ValidationError("official no-thinking prefix lacks the trained empty think block")
-        inputs = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True,
-                                               add_generation_prompt=True, enable_thinking=False,
-                                               return_tensors="pt")
-        attention_mask = torch.ones_like(inputs, device="cuda")
-        output = model.generate(input_ids=inputs.to("cuda"), attention_mask=attention_mask, max_new_tokens=4, do_sample=False)
+        encoded = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=True,
+                                                add_generation_prompt=True, enable_thinking=False,
+                                                return_tensors="pt")
+        if isinstance(encoded, Mapping):
+            inputs = encoded["input_ids"]
+            attention_mask = encoded.get("attention_mask", torch.ones_like(inputs))
+        else:
+            inputs = encoded
+            attention_mask = torch.ones_like(inputs)
+        output = model.generate(input_ids=inputs.to("cuda"), attention_mask=attention_mask.to("cuda"), max_new_tokens=4, do_sample=False)
         if output.shape[-1] <= inputs.shape[-1]:
             raise ValidationError("text-only staging smoke generated no tokens")
         return {"model_class": model.__class__.__name__, "model_type": config.model_type,
