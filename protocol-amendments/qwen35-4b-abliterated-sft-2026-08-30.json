@@ -1,68 +1,130 @@
 {
-  "format": "qwen35-4b-abliterated-sft-exploratory-amendment-v1",
-  "date": "2026-08-30",
-  "status": "exploratory-child-frozen-not-authorized-to-execute",
-  "authorization_gate": "No staging, GPU smoke, training, or acceptance execution is authorized until a future user-approved plan and real-GPU smoke/adversarial acceptance.",
+  "authorization": {
+    "epochs": 1,
+    "hardware_policy": {
+      "gpu_count": 1,
+      "ordered_exact_names": [
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+        "NVIDIA RTX PRO 4500 Blackwell"
+      ]
+    },
+    "post_full": "mirror and validate the exact smoke and full artifacts before deleting the exact verified pod; preserve the volume",
+    "required_gates": [
+      "verified pinned model staging",
+      "all-20000 token audit before model construction",
+      "saved-checkpoint one-step smoke over 128 samples",
+      "disjoint resume smoke proving restore and continuation",
+      "runtime acceptance of both fresh smoke and resume smoke before initial full run"
+    ],
+    "seed": 42
+  },
+  "authorization_gate": "User authorizes only the pinned staging, saved-checkpoint smoke, disjoint resume smoke, and then accepted-smoke-bound full run; each gate must pass before the next begins.",
   "base": {
-    "repo_id": "Qwen/Qwen3.5-4B-Base",
-    "revision": "1001bb4d826a52d1f399e183466143f4da7b741b",
-    "local_dir": "/workspace/models/Qwen/Qwen3.5-4B-Base",
     "architecture": "Qwen3_5ForConditionalGeneration",
-    "model_type": "qwen3_5",
     "hf_home": "/workspace/.cache/huggingface",
     "hf_hub_disable_xet": "1",
-    "staging_gate": "new terminal staging run with verified qwen35-4b-base-staging-v1 manifest",
-    "staging_evidence": "resolved exact revision, Hugging Face download metadata, required snapshot files, BF16 offline architecture/template smoke, and physical file hashes"
+    "local_dir": "/workspace/models/Qwen/Qwen3.5-4B-Base",
+    "model_type": "qwen3_5",
+    "repo_id": "Qwen/Qwen3.5-4B-Base",
+    "revision": "1001bb4d826a52d1f399e183466143f4da7b741b",
+    "staging_evidence": "resolved exact revision, Hugging Face download metadata, required snapshot files, BF16 offline architecture/template smoke, and physical file hashes",
+    "staging_gate": "new terminal staging run with verified qwen35-4b-base-staging-v1 manifest"
   },
   "corpus": {
-    "path": "/workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl",
-    "sha256": "b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90",
-    "rows": 20000,
+    "evaluation_rows": "excluded",
     "ordering": "frozen-clean-19996-then-authoritative-organic4",
-    "teacher": "huihui-ai/Huihui-Qwen3.5-9B-abliterated",
-    "evaluation_rows": "excluded"
+    "path": "/workspace/runs/abliterated-20000-20260829T022737Z/output/rollouts.jsonl",
+    "rows": 20000,
+    "sha256": "b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90",
+    "teacher": "huihui-ai/Huihui-Qwen3.5-9B-abliterated"
   },
-  "rendering": {
-    "source": "same staged official processor/tokenizer revision only",
-    "messages": "user and assistant only; no system message",
-    "enable_thinking": false,
-    "method": "apply_chat_template twice: user add_generation_prompt=true, then user+assistant add_generation_prompt=false",
-    "assistant_reasoning_content": "explicit empty string so preserved teacher <think> tags remain verbatim answer content",
-    "prefix_requirement": "prefix token IDs are strict prefix of full token IDs",
-    "masking": "mask the official user generation prefix, including its empty <think>...</think> block; train only stripped response plus <|im_end|>",
-    "length": "audit all 20000 at 16384 and fail rather than truncate/drop"
-  },
+  "date": "2026-08-30",
+  "format": "qwen35-4b-abliterated-sft-live-authorization-v2",
   "lora": {
+    "alpha": 32,
+    "bias": "none",
+    "dropout": 0.0,
+    "frozen": "vision tower, embeddings, tied lm head; only LoRA parameters trainable",
     "peft": "0.18.1",
     "rank": 32,
-    "alpha": 32,
-    "dropout": 0.0,
-    "bias": "none",
     "target_count": 248,
-    "targets": "24 linear_attn x [in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj] + 8 self_attn x [q_proj,k_proj,v_proj,o_proj] + 32 mlp x [gate_proj,up_proj,down_proj]",
-    "frozen": "vision tower, embeddings, tied lm head; only LoRA parameters trainable"
+    "targets": "24 linear_attn x [in_proj_qkv,in_proj_z,in_proj_b,in_proj_a,out_proj] + 8 self_attn x [q_proj,k_proj,v_proj,o_proj] + 32 mlp x [gate_proj,up_proj,down_proj]"
   },
   "recipe": {
-    "seed": 42,
-    "epochs": 1,
-    "effective_batch": 128,
-    "microbatch": 1,
-    "learning_rate": 0.0006,
-    "warmup_ratio": 0.05,
+    "adamw": {
+      "betas": [
+        0.9,
+        0.95
+      ],
+      "eps": 1e-12,
+      "weight_decay": 0.0
+    },
+    "checkpoints": "every 512 samples, latest two retained, atomic evidence/resume into a disjoint run; final group has 32 examples",
     "cosine_final_fraction": 0.1,
-    "adamw": {"betas": [0.9, 0.95], "eps": 1e-12, "weight_decay": 0.0},
+    "effective_batch": 128,
+    "epochs": 1,
     "gradient_clip": 1.0,
+    "learning_rate": 0.0006,
+    "microbatch": 1,
     "objective": "sum per-example mean losses without accumulation division",
     "order": "same-seed load shuffle followed by fresh same-seed epoch shuffle",
-    "checkpoints": "every 512 samples, latest two retained, atomic evidence/resume into a disjoint run; final group has 32 examples"
+    "seed": 42,
+    "warmup_ratio": 0.05
+  },
+  "rendering": {
+    "assistant_reasoning_content": "explicit empty string so preserved teacher <think> tags remain verbatim answer content",
+    "enable_thinking": false,
+    "length": "audit all 20000 at 16384 and fail rather than truncate/drop",
+    "masking": "mask the official user generation prefix, including its empty <think>...</think> block; train only stripped response plus <|im_end|>",
+    "messages": "user and assistant only; no system message",
+    "method": "apply_chat_template twice: user add_generation_prompt=true, then user+assistant add_generation_prompt=false",
+    "prefix_requirement": "prefix token IDs are strict prefix of full token IDs",
+    "source": "same staged official processor/tokenizer revision only"
+  },
+  "roles": {
+    "full": {
+      "max_steps": false,
+      "optimizer_steps": 157,
+      "requires": "accepted fresh-smoke and resume-smoke bindings inherited by full resume",
+      "samples": 20000,
+      "skip_save": false
+    },
+    "resume_smoke": {
+      "acceptance": "proves optimizer/scheduler/RNG restore and continuation",
+      "checkpoint_save_required": true,
+      "destination": "disjoint new run",
+      "optimizer_steps": 1,
+      "samples": 128,
+      "source": "saved smoke checkpoint"
+    },
+    "smoke": {
+      "acceptance": "terminal static and runtime validation",
+      "checkpoint_save_required": true,
+      "optimizer_steps": 1,
+      "resume": false,
+      "samples": 128
+    }
   },
   "runtime": {
-    "gpu": "exactly one NVIDIA A100-SXM4-80GB",
-    "precision": "BF16",
+    "fast_paths": {
+      "causal-conv1d": "1.7.0",
+      "flash-linear-attention": "0.5.2",
+      "require_transformers_reports_available": true
+    },
+    "forbidden": [
+      "quantization",
+      "offload",
+      "fallback model",
+      "reference hybrid attention fallback"
+    ],
+    "gpu": "exactly one GPU selected in ordered policy: NVIDIA RTX PRO 6000 Blackwell Server Edition, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, NVIDIA RTX PRO 4500 Blackwell",
+    "gpu_count": 1,
+    "huggingface_hub": "1.28.0",
     "local_only": true,
-    "trust_remote_code": false,
-    "forbidden": ["quantization", "offload", "fallback model", "reference hybrid attention fallback"],
-    "fast_paths": {"flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0", "require_transformers_reports_available": true},
-    "huggingface_hub": "1.28.0"
-  }
+    "precision": "BF16",
+    "record_actual_gpu_in_immutable_runtime_evidence": true,
+    "trust_remote_code": false
+  },
+  "status": "user-authorized-live-execution-pending-required-gates"
 }

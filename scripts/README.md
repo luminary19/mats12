@@ -208,3 +208,7 @@ Important guarantees:
 - SSH/API transport failure is not shutdown evidence.
 - Only `pod-down` confirmation or the provider console establishes deletion.
 - No script deletes the network volume.
+
+## Qwen3.5-4B Base LoRA
+
+`stage-qwen35-4b.ps1` installs the pinned disposable runtime and launches/monitors revision-pinned staging on an already provisioned authorized GPU; it never provisions hardware. `train-qwen35-4b-lora.ps1` plans, launches fresh or resume smoke runs, runtime-validates either smoke, launches an initial full run only with both accepted smoke IDs, resumes a full run into a disjoint run, or monitors. `watch-qwen35-4b-training.ps1` is fail-open: it mirrors the exact fresh-smoke/resume-smoke/full inventories transactionally, runs the static validator, and deletes only the expected pod at the expected deployed commit; the volume is preserved.

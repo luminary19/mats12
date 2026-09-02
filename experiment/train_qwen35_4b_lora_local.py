@@ -1,4 +1,4 @@
-"""Single-A100, completion-only LoRA SFT for the staged Qwen3.5-4B Base checkpoint.
+"""Single-authorized-Blackwell-GPU completion-only LoRA SFT for staged Qwen3.5-4B Base.
 
 The plan path remains CPU/lazy: it validates immutable corpus and staging evidence but
 never imports torch, transformers, PEFT, or Hub clients.  Execute is intentionally
@@ -15,6 +15,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,8 @@ CORPUS_MANIFEST_PATH = Path("/workspace/runs/abliterated-20000-20260829T022737Z/
 FINALIZER_MANIFEST_PATH = Path("/workspace/runs/abliterated-20000-20260829T022737Z/manifest.json")
 EVALUATION_QUESTIONS_PATH = Path("/workspace/code/external/hereditary/chinese_censorship_eval/data/test_questions_explicit.json")
 FINAL_CORPUS_SHA256 = "b404c94e81510d5b17e3f04df38d7905aa639cbe0343db0fc925a317164dee90"
+CORPUS_MANIFEST_SHA256 = "bfb5224a408415a11202e1de461514aa62999d29f9da8630a451aa22c799d4db"
+FINALIZER_MANIFEST_SHA256 = "8d9fe1ccc21e37c65a0e2e0236e1e55c9b40ab003fabeb6765d6655cece8a721"
 CLEAN_CORPUS_SHA256 = "be7f9906584133f9ede6b925ec933968d5b6a101b610a4dff7670064c147e315"
 ORGANIC_CORPUS_SHA256 = "869ca9b05ae66a84deb6d89119a42012c987c68d0eec3288a35c53cabb12c708"
 CORPUS_ORDERING = "frozen-clean-19996-then-authoritative-organic4"
@@ -42,7 +45,12 @@ ROW_KEYS = ("id", "source", "prompt", "response", "model")
 EXPECTED_ROWS = 20_000
 BASE_ID, BASE_REVISION, BASE_PATH = staging.REPO_ID, staging.REVISION, staging.LOCAL_DIR
 MAX_LENGTH = 16_384
-AUTHORIZED_GPU_NAME = "NVIDIA A100-SXM4-80GB"
+AUTHORIZED_GPU_NAMES = (
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+    "NVIDIA RTX PRO 4500 Blackwell",
+)
+LAUNCH_EVIDENCE_FORMAT = "qwen35-4b-trainer-launch-v1"
 PEFT_VERSION = "0.18.1"
 RUNTIME_VERSIONS = {"torch": "2.8.0+cu128", "transformers": "5.16.1", "accelerate": "1.10.1", "peft": PEFT_VERSION, "safetensors": "0.8.0", "huggingface-hub": "1.28.0", "flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0"}
 FROZEN = {"epochs": 1, "effective_batch": 128, "micro_batch": 1, "lr": 6e-4, "warmup_ratio": .05,
@@ -51,9 +59,9 @@ FROZEN = {"epochs": 1, "effective_batch": 128, "micro_batch": 1, "lr": 6e-4, "wa
 TINKER_ADAMW_PARAMS = {"betas": (.9, .95), "eps": 1e-12}
 CHECKPOINT_EVERY_SAMPLES, CHECKPOINT_RETAIN = 512, 2
 CHECKPOINT_FORMAT = "qwen35-4b-local-lora-checkpoint-v1"
-RUN_FORMAT = "qwen35-4b-local-lora-run-v1"
+RUN_FORMAT = "qwen35-4b-local-lora-run-v2"
 AMENDMENT = "protocol-amendments/qwen35-4b-abliterated-sft-2026-08-30.json"
-AMENDMENT_SHA256 = "6b6af015275438d3c7fc08fd9bff0759fe8aed38f1afe9815b6cb005b0b4b6ae"
+AMENDMENT_SHA256 = "f8c9d41ddf5dc50778ba22596b282fc7672a87067a977dd95f8cbedaae65063c"
 WORKSPACE_RUNS = Path("/workspace/runs")
 MAX_RECOMPUTED_PROCESSED_SAMPLES = 512
 LINEAR_ATTN_SUFFIXES = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj")
@@ -72,12 +80,14 @@ def _canonical_sha256(value: Any) -> str:
 def _validate_amendment() -> str:
     path = _repo_root() / AMENDMENT
     if not path.is_file() or sha256_file(path) != AMENDMENT_SHA256:
-        raise ValidationError("Qwen protocol amendment bytes differ from the frozen amendment")
+        raise ValidationError("Qwen protocol amendment bytes differ from the authorized amendment")
     amendment = _load_json(path, "Qwen protocol amendment")
     base = amendment.get("base", {}); corpus = amendment.get("corpus", {}); rendering = amendment.get("rendering", {})
     lora = amendment.get("lora", {}); recipe = amendment.get("recipe", {}); runtime = amendment.get("runtime", {})
-    if (amendment.get("format") != "qwen35-4b-abliterated-sft-exploratory-amendment-v1" or amendment.get("date") != "2026-08-30"
-            or amendment.get("status") != "exploratory-child-frozen-not-authorized-to-execute"
+    authorization = amendment.get("authorization", {}); roles = amendment.get("roles", {})
+    if (amendment.get("format") != "qwen35-4b-abliterated-sft-live-authorization-v2" or amendment.get("date") != "2026-08-30"
+            or amendment.get("status") != "user-authorized-live-execution-pending-required-gates"
+            or amendment.get("authorization_gate") != "User authorizes only the pinned staging, saved-checkpoint smoke, disjoint resume smoke, and then accepted-smoke-bound full run; each gate must pass before the next begins."
             or base.get("repo_id") != BASE_ID or base.get("revision") != BASE_REVISION or base.get("local_dir") != BASE_PATH
             or base.get("architecture") != "Qwen3_5ForConditionalGeneration" or base.get("model_type") != "qwen3_5"
             or base.get("hf_home") != staging.HF_HOME or base.get("hf_hub_disable_xet") != "1"
@@ -91,12 +101,14 @@ def _validate_amendment() -> str:
             or any(recipe.get(key) != value for key, value in {"seed": 42, "epochs": 1, "effective_batch": 128, "microbatch": 1, "learning_rate": 6e-4, "warmup_ratio": .05, "cosine_final_fraction": .1, "gradient_clip": 1.0}.items())
             or recipe.get("adamw") != {"betas": [.9, .95], "eps": 1e-12, "weight_decay": 0.0}
             or recipe.get("objective") != "sum per-example mean losses without accumulation division" or recipe.get("order") != "same-seed load shuffle followed by fresh same-seed epoch shuffle" or recipe.get("checkpoints") != "every 512 samples, latest two retained, atomic evidence/resume into a disjoint run; final group has 32 examples"
-            or runtime.get("gpu") != "exactly one NVIDIA A100-SXM4-80GB" or runtime.get("precision") != "BF16" or runtime.get("local_only") is not True or runtime.get("trust_remote_code") is not False
+            or runtime.get("gpu") != "exactly one GPU selected in ordered policy: NVIDIA RTX PRO 6000 Blackwell Server Edition, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, NVIDIA RTX PRO 4500 Blackwell" or runtime.get("gpu_count") != 1 or runtime.get("record_actual_gpu_in_immutable_runtime_evidence") is not True
+            or runtime.get("precision") != "BF16" or runtime.get("local_only") is not True or runtime.get("trust_remote_code") is not False
             or runtime.get("forbidden") != ["quantization", "offload", "fallback model", "reference hybrid attention fallback"]
-            or runtime.get("huggingface_hub") != "1.28.0" or runtime.get("fast_paths") != {"flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0", "require_transformers_reports_available": True}):
-        raise ValidationError("Qwen protocol amendment semantics differ from frozen recipe")
+            or runtime.get("huggingface_hub") != "1.28.0" or runtime.get("fast_paths") != {"flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0", "require_transformers_reports_available": True}
+            or authorization != {"seed": 42, "epochs": 1, "hardware_policy": {"gpu_count": 1, "ordered_exact_names": list(AUTHORIZED_GPU_NAMES)}, "required_gates": ["verified pinned model staging", "all-20000 token audit before model construction", "saved-checkpoint one-step smoke over 128 samples", "disjoint resume smoke proving restore and continuation", "runtime acceptance of both fresh smoke and resume smoke before initial full run"], "post_full": "mirror and validate the exact smoke and full artifacts before deleting the exact verified pod; preserve the volume"}
+            or roles != {"smoke": {"optimizer_steps": 1, "samples": 128, "checkpoint_save_required": True, "resume": False, "acceptance": "terminal static and runtime validation"}, "resume_smoke": {"source": "saved smoke checkpoint", "destination": "disjoint new run", "optimizer_steps": 1, "samples": 128, "checkpoint_save_required": True, "acceptance": "proves optimizer/scheduler/RNG restore and continuation"}, "full": {"optimizer_steps": 157, "samples": 20000, "max_steps": False, "skip_save": False, "requires": "accepted fresh-smoke and resume-smoke bindings inherited by full resume"}}):
+        raise ValidationError("Qwen protocol amendment semantics differ from the authorized recipe")
     return AMENDMENT_SHA256
-
 
 def _assert_frozen_args(args: argparse.Namespace) -> None:
     _validate_amendment()
@@ -376,10 +388,15 @@ def assert_runtime_versions() -> dict[str, str]:
     return found
 
 
-def _runtime(torch: Any) -> dict[str, Any]:
-    if not torch.cuda.is_available() or torch.cuda.device_count() != 1 or torch.cuda.get_device_name(0) != AUTHORIZED_GPU_NAME:
-        raise ValidationError("execute requires exactly one NVIDIA A100-SXM4-80GB")
-    return {"gpu": {"name": torch.cuda.get_device_name(0), "total_memory": torch.cuda.get_device_properties(0).total_memory}, "packages": assert_runtime_versions(), "python": sys.version}
+def _runtime(torch: Any, run_kind: str) -> dict[str, Any]:
+    if run_kind not in {"smoke", "full"}:
+        raise ValidationError("run kind must be smoke or full")
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise ValidationError("execute requires exactly one CUDA GPU")
+    name = torch.cuda.get_device_name(0)
+    if name not in AUTHORIZED_GPU_NAMES:
+        raise ValidationError("execute GPU is not in the authorized exact-name policy: %s" % name)
+    return {"gpu": {"name": name, "total_memory": torch.cuda.get_device_properties(0).total_memory}, "packages": assert_runtime_versions(), "python": sys.version, "run_kind": run_kind, "authorized_gpu_policy": list(AUTHORIZED_GPU_NAMES)}
 
 
 def _load_tokenizer() -> Any:
@@ -395,11 +412,12 @@ def plan(args: argparse.Namespace) -> dict[str, Any]:
     _assert_frozen_args(args)
     rows = validate_authoritative_corpus(args.corpus, args.corpus_manifest, args.finalizer_manifest)
     assert_no_evaluation_rows(rows, args.evaluation_questions)
-    manifest = validate_staging(args.staging_manifest)
-    # Plan cannot tokenize: importing Transformers/CUDA would violate its lazy contract.
-    return {"format": "qwen35-4b-local-lora-plan-v1", "network": "not contacted", "cuda_initialized": False,
+    # A pre-staging plan remains CPU-only and reports its pending gate.  If a manifest is
+    # supplied, verify it fully; execute independently requires that verification.
+    manifest = validate_staging(args.staging_manifest) if args.staging_manifest is not None and args.staging_manifest.is_file() else None
+    return {"format": "qwen35-4b-local-lora-plan-v2", "network": "not contacted", "cuda_initialized": False,
             "corpus_sha256": sha256_file(args.corpus), "corpus": {"resolved_path": str(args.corpus.resolve()), "manifest_resolved_path": str(args.corpus_manifest.resolve()), "finalizer_resolved_path": str(args.finalizer_manifest.resolve()), "durable_path": CORPUS_PATH.as_posix(), "ordering": CORPUS_ORDERING, "teacher": TEACHER_MODEL_ID},
-            "staging_integrity_sha256": manifest["integrity_sha256"], "rendering": "official-local-tokenizer.apply_chat_template enable_thinking=False twice",
+            "staging": {"required": True, "verified": manifest is not None, "integrity_sha256": None if manifest is None else manifest["integrity_sha256"], "manifest_sha256": None if manifest is None else sha256_file(args.staging_manifest)}, "rendering": "official-local-tokenizer.apply_chat_template enable_thinking=False twice",
             "masking": "mask official user generation prefix including empty think block; train response plus im_end",
             "whitespace_transform": whitespace_transform_report(rows), "data_order": "same-seed load shuffle then fresh same-seed epoch shuffle"}
 
@@ -530,17 +548,22 @@ def validate_resume_checkpoint(checkpoint: Path, args: argparse.Namespace, order
 
 
 def _safe_training_run_dir(run_dir: Path) -> Path:
-    if run_dir.parent != WORKSPACE_RUNS or run_dir.name in {"", ".", ".."} or "/" in run_dir.name or "\\" in run_dir.name:
-        raise ValidationError("training run directory must be a direct new /workspace/runs/<run-id> child")
-    if run_dir.exists(): raise ValidationError("execute requires a new unused run directory")
+    if run_dir.parent != WORKSPACE_RUNS or run_dir.name in {"", ".", ".."} or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", run_dir.name):
+        raise ValidationError("training run directory must be a direct safe /workspace/runs/<run-id> child")
     return run_dir
 
 
-def _assert_disjoint_run(run_dir: Path, checkpoint: Path, parent: Mapping[str, Any]) -> None:
-    destination, source = run_dir.resolve(strict=False), Path(parent["run_dir"]).resolve(strict=True)
-    if source.parent != WORKSPACE_RUNS or destination == source or destination.is_relative_to(source) or source.is_relative_to(destination) or checkpoint.resolve().parent != source / "checkpoints":
-        raise ValidationError("resume destination must be a disjoint direct child of /workspace/runs")
 
+def _assert_disjoint_run(run_dir: Path, checkpoint: Path, parent: Mapping[str, Any]) -> None:
+    try:
+        destination = run_dir.resolve(strict=False)
+        source = Path(parent["run_dir"]).resolve(strict=True)
+        checkpoint_resolved = checkpoint.resolve(strict=True)
+    except (KeyError, OSError) as exc:
+        raise ValidationError("resume path identity cannot be resolved") from exc
+    if (source.parent != WORKSPACE_RUNS or checkpoint_resolved.parent != source / "checkpoints"
+            or destination == source or destination.is_relative_to(source) or source.is_relative_to(destination)):
+        raise ValidationError("resume destination must be a disjoint direct child of /workspace/runs")
 
 def _collate(feature: Mapping[str, Any], pad_id: int, torch: Any) -> tuple[Any, Any, Any]:
     ids, labels = feature["input_ids"], feature["labels"]
@@ -601,53 +624,257 @@ def _execution_provenance() -> tuple[dict[str, Any], str]:
     return {"repository": repository, "script_sha256": sha256_file(Path(__file__)), "requirements_sha256": sha256_file(requirements), "package_lock_sha256": sha256_text(lock)}, lock
 
 
+def _current_clean_commit() -> str:
+    try:
+        commit = subprocess.run(["git", "-C", str(_repo_root()), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(_repo_root()), "status", "--porcelain"], check=True, capture_output=True, text=True).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValidationError("trainer checkout commit cannot be verified") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or dirty:
+        raise ValidationError("detached launch requires a clean, committed trainer checkout")
+    return commit
+
+
+def _adopt_launcher_evidence(run_dir: Path) -> dict[str, Any] | None:
+    """Adopt only the fsynced detached-launch handoff, never an existing run."""
+    if not run_dir.exists():
+        return None
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        raise ValidationError("existing run path is not an adoptable directory")
+    entries = list(run_dir.iterdir())
+    if {item.name for item in entries} != {"launch.json", "stdout.log", "stderr.log"}:
+        raise ValidationError("existing run directory is not exactly detached launcher evidence")
+    for item in entries:
+        if item.is_symlink() or not stat.S_ISREG(item.lstat().st_mode):
+            raise ValidationError("detached launcher evidence must contain regular non-symlink files")
+    launch = _load_json(run_dir / "launch.json", "detached launch handoff")
+    if (set(launch) != {"format", "run_id", "commit", "pid", "start_identity"}
+            or launch.get("format") != LAUNCH_EVIDENCE_FORMAT or launch.get("run_id") != run_dir.name
+            or not isinstance(launch.get("pid"), int) or launch["pid"] < 1
+            or not isinstance(launch.get("start_identity"), str) or not launch["start_identity"].isdigit()
+            or not isinstance(launch.get("commit"), str) or not re.fullmatch(r"[0-9a-f]{40}", launch["commit"])):
+        raise ValidationError("detached launcher handoff semantics differ")
+    if launch["commit"] != _current_clean_commit():
+        raise ValidationError("detached launcher commit differs from the deployed trainer checkout")
+    for item in entries:
+        with item.open("r+b") as handle:
+            os.fsync(handle.fileno())
+    _fsync_directory(run_dir)
+    return {"format": LAUNCH_EVIDENCE_FORMAT, "launch_json_sha256": sha256_file(run_dir / "launch.json"),
+            "run_id": launch["run_id"], "commit": launch["commit"], "pid": launch["pid"],
+            "start_identity": launch["start_identity"], "stdout": "stdout.log", "stderr": "stderr.log"}
+
+
+def _materialize_run_dir(run_dir: Path, launcher: Mapping[str, Any] | None) -> None:
+    if launcher is None:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        _fsync_directory(run_dir.parent)
+    else:
+        _fsync_directory(run_dir)
+
+
+def _checkpoint_index(run_dir: Path) -> list[Path]:
+    root = run_dir / "checkpoints"
+    index = _load_json(root / "index.json", "checkpoint index")
+    names = index.get("checkpoints")
+    if index.get("format") != "qwen35-checkpoint-index-v1" or not isinstance(names, list) or not names or any(not isinstance(name, str) or not re.fullmatch(r"step-[0-9]{6}", name) for name in names) or names != sorted(names) or len(names) > CHECKPOINT_RETAIN:
+        raise ValidationError("checkpoint index is invalid")
+    checkpoints = [root / name for name in names]
+    visible = sorted(item for item in root.iterdir() if item.is_dir() and not item.name.startswith("."))
+    if checkpoints != visible:
+        raise ValidationError("checkpoint index and retained checkpoint directories differ")
+    for checkpoint in checkpoints:
+        validate_checkpoint_payload(checkpoint)
+    return checkpoints
+
+
+def _smoke_acceptance(smoke_run: Path, *, create: bool = False) -> dict[str, Any]:
+    checkpoint = smoke_run / "checkpoints" / "step-000001"
+    acceptance = {"format": "qwen35-4b-smoke-acceptance-v1", "done_sha256": sha256_file(smoke_run / "DONE"),
+                  "manifest_sha256": sha256_file(smoke_run / "manifest.json"), "runtime_sha256": sha256_file(smoke_run / "runtime.json"),
+                  "checkpoint_manifest_sha256": sha256_file(checkpoint / "checkpoint-manifest.json")}
+    path = smoke_run / "SMOKE_ACCEPTED"
+    if path.exists():
+        if _load_json(path, "smoke acceptance") != acceptance:
+            raise ValidationError("smoke acceptance evidence differs from completed smoke")
+    elif create:
+        atomic_write_json(path, acceptance)
+    else:
+        raise ValidationError("fresh smoke lacks runtime acceptance evidence")
+    return acceptance
+
+
+def _accepted_smoke_identity(smoke_run: Path, full_run: Path, *, require_remote_child: bool = True,
+                             identity_path: str | None = None, runtime_reload: bool = False) -> dict[str, Any]:
+    smoke_run, full_run = Path(smoke_run), Path(full_run)
+    if require_remote_child:
+        smoke_run, full_run = _safe_training_run_dir(smoke_run), _safe_training_run_dir(full_run)
+    elif smoke_run.parent != full_run.parent or smoke_run.is_symlink() or full_run.is_symlink():
+        raise ValidationError("mirrored smoke and full runs must be non-symlink siblings")
+    if smoke_run == full_run:
+        raise ValidationError("accepted smoke must be distinct from full run")
+    validate_completed_run(smoke_run, "smoke", runtime_reload=runtime_reload, require_fresh_smoke=True)
+    checkpoint = smoke_run / "checkpoints" / "step-000001"
+    acceptance = _smoke_acceptance(smoke_run)
+    return {"run_id": smoke_run.name, "path": identity_path if identity_path is not None else str(smoke_run),
+            "done_sha256": acceptance["done_sha256"], "manifest_sha256": acceptance["manifest_sha256"],
+            "runtime_sha256": acceptance["runtime_sha256"], "checkpoint": checkpoint.name,
+            "checkpoint_manifest_sha256": acceptance["checkpoint_manifest_sha256"], "acceptance_sha256": sha256_file(smoke_run / "SMOKE_ACCEPTED")}
+
+
+def _resume_smoke_acceptance(run: Path, *, create: bool = False) -> dict[str, Any]:
+    checkpoint = run / "checkpoints" / "step-000002"
+    continuation = _load_json(run / "manifest.json", "resume-smoke manifest").get("continuation")
+    acceptance = {"format": "qwen35-4b-resume-smoke-acceptance-v1",
+                  "done_sha256": sha256_file(run / "DONE"),
+                  "manifest_sha256": sha256_file(run / "manifest.json"),
+                  "runtime_sha256": sha256_file(run / "runtime.json"),
+                  "checkpoint_manifest_sha256": sha256_file(checkpoint / "checkpoint-manifest.json"),
+                  "parent_checkpoint_manifest_sha256": continuation.get("parent_checkpoint_manifest_sha256") if isinstance(continuation, dict) else None}
+    path = run / "RESUME_SMOKE_ACCEPTED"
+    if path.exists():
+        if _load_json(path, "resume-smoke acceptance") != acceptance:
+            raise ValidationError("resume-smoke acceptance differs from completed evidence")
+    elif create:
+        atomic_write_json(path, acceptance)
+    else:
+        raise ValidationError("resume smoke lacks runtime acceptance evidence")
+    return acceptance
+
+
+def _accepted_resume_smoke_identity(resume_run: Path, fresh_identity: Mapping[str, Any], full_run: Path, *,
+                                      require_remote_child: bool = True, identity_path: str | None = None,
+                                      runtime_reload: bool = False) -> dict[str, Any]:
+    resume_run, full_run = Path(resume_run), Path(full_run)
+    if require_remote_child:
+        resume_run, full_run = _safe_training_run_dir(resume_run), _safe_training_run_dir(full_run)
+    elif resume_run.parent != full_run.parent or resume_run.is_symlink() or full_run.is_symlink():
+        raise ValidationError("mirrored resume smoke and full runs must be non-symlink siblings")
+    validate_completed_run(resume_run, "smoke", runtime_reload=runtime_reload, require_resume_smoke=True)
+    manifest = _load_json(resume_run / "manifest.json", "resume-smoke manifest")
+    continuation = manifest.get("continuation")
+    if (not isinstance(continuation, dict) or continuation.get("start_global_step") != 1 or
+            continuation.get("start_next_order_offset") != 128 or
+            Path(continuation.get("parent_checkpoint", "")).name != "step-000001" or
+            Path(continuation.get("parent_run", "")).name != fresh_identity.get("run_id")):
+        raise ValidationError("resume smoke is not the exact continuation of the fresh smoke")
+    acceptance = _resume_smoke_acceptance(resume_run)
+    return {"run_id": resume_run.name, "path": identity_path if identity_path is not None else str(resume_run),
+            "done_sha256": acceptance["done_sha256"], "manifest_sha256": acceptance["manifest_sha256"],
+            "runtime_sha256": acceptance["runtime_sha256"], "checkpoint": "step-000002",
+            "checkpoint_manifest_sha256": acceptance["checkpoint_manifest_sha256"],
+            "parent_checkpoint_manifest_sha256": acceptance["parent_checkpoint_manifest_sha256"],
+            "acceptance_sha256": sha256_file(resume_run / "RESUME_SMOKE_ACCEPTED")}
+
+
+def _inherited_full_gate_identities(args: argparse.Namespace, checkpoint: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    metadata = validate_checkpoint_payload(checkpoint).get("metadata", {})
+    parent = Path(metadata.get("run_dir", ""))
+    if not isinstance(metadata, dict) or not parent.is_dir() or sha256_file(parent / "manifest.json") != metadata.get("run_manifest_sha256"):
+        raise ValidationError("resume parent manifest cannot be verified")
+    parent_manifest = _load_json(parent / "manifest.json", "resume parent manifest")
+    inherited_smoke, inherited_resume = parent_manifest.get("accepted_smoke"), parent_manifest.get("accepted_resume_smoke")
+    if (not isinstance(inherited_smoke, dict) or not isinstance(inherited_smoke.get("path"), str) or
+            not isinstance(inherited_resume, dict) or not isinstance(inherited_resume.get("path"), str)):
+        raise ValidationError("full resume parent lacks smoke and resume-smoke bindings")
+    if args.accepted_smoke_run is not None and Path(args.accepted_smoke_run) != Path(inherited_smoke["path"]):
+        raise ValidationError("resume accepted smoke differs from parent binding")
+    if args.accepted_resume_smoke_run is not None and Path(args.accepted_resume_smoke_run) != Path(inherited_resume["path"]):
+        raise ValidationError("resume accepted resume-smoke differs from parent binding")
+    actual_smoke = _accepted_smoke_identity(Path(inherited_smoke["path"]), args.run_dir)
+    actual_resume = _accepted_resume_smoke_identity(Path(inherited_resume["path"]), actual_smoke, args.run_dir)
+    if actual_smoke != inherited_smoke or actual_resume != inherited_resume:
+        raise ValidationError("resume smoke-gate evidence differs from parent binding")
+    return actual_smoke, actual_resume
+
+
 def _validate_execution_mode(args: argparse.Namespace) -> None:
-    if args.max_steps is not None and args.max_steps < 1: raise ValidationError("max-steps must be positive")
-    total = len(accumulation_group_sizes(EXPECTED_ROWS, args.effective_batch))
-    requested = total if args.max_steps is None else min(total, args.max_steps)
-    if args.skip_save and (args.resume_from is not None or requested >= total):
-        raise ValidationError("skip-save is allowed only for a non-resume smoke ending before full training")
+    if args.run_kind not in {"smoke", "full"}:
+        raise ValidationError("--run-kind smoke|full is required for execute")
+    if args.max_steps is not None and args.max_steps < 1:
+        raise ValidationError("max-steps must be positive")
+    if args.run_kind == "smoke":
+        if args.max_steps != 1 or args.skip_save or args.accepted_smoke_run is not None or args.accepted_resume_smoke_run is not None:
+            raise ValidationError("smoke requires exactly --max-steps 1, checkpoint saving, and no accepted smoke arguments")
+    elif args.max_steps is not None or args.skip_save:
+        raise ValidationError("full training never permits max-steps or skip-save")
+    elif args.resume_from is None and (args.accepted_smoke_run is None or args.accepted_resume_smoke_run is None):
+        raise ValidationError("initial full training requires accepted fresh-smoke and resume-smoke runs")
 
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     _assert_frozen_args(args)
+    args.run_dir = _safe_training_run_dir(args.run_dir)
+    clean_commit = _current_clean_commit()
+    launcher = _adopt_launcher_evidence(args.run_dir)
+    if launcher is None or launcher.get("commit") != clean_commit:
+        raise ValidationError("execute requires a clean detached-launch handoff")
+    _materialize_run_dir(args.run_dir, launcher)
+    atomic_write_json(args.run_dir / "launcher-adopted.json", {"launcher_evidence": launcher})
     _validate_execution_mode(args)
-    _safe_training_run_dir(args.run_dir)
+    args.accepted_smoke_identity = None
+    args.accepted_resume_smoke_identity = None
+    order = tinker_single_epoch_order(EXPECTED_ROWS, args.seed)
+    resume_meta = None
+    if args.resume_from is not None:
+        resume_meta = validate_resume_checkpoint(args.resume_from, args, order)
+        _assert_disjoint_run(args.run_dir, args.resume_from, resume_meta)
+        if args.run_kind == "smoke":
+            if (args.resume_from.name != "step-000001" or resume_meta.get("global_step") != 1 or
+                    resume_meta.get("next_order_offset") != 128 or accumulation_group_sizes()[1] != 128):
+                raise ValidationError("resume smoke must restore the fresh step-1/offset-128 checkpoint and continue to step 2")
+            parent_manifest = _load_json(Path(resume_meta["run_dir"]) / "manifest.json", "resume-smoke parent manifest")
+            if parent_manifest.get("run_kind") != "smoke" or parent_manifest.get("continuation") is not None:
+                raise ValidationError("resume smoke source must be the fresh smoke run")
+    if args.run_kind == "full":
+        if args.resume_from:
+            args.accepted_smoke_identity, args.accepted_resume_smoke_identity = _inherited_full_gate_identities(args, args.resume_from)
+        else:
+            args.accepted_smoke_identity = _accepted_smoke_identity(Path(args.accepted_smoke_run), args.run_dir)
+            args.accepted_resume_smoke_identity = _accepted_resume_smoke_identity(Path(args.accepted_resume_smoke_run), args.accepted_smoke_identity, args.run_dir)
+    if args.staging_manifest is None:
+        raise ValidationError("execute requires the verified staging manifest")
+    validate_staging(args.staging_manifest)
     prepared = plan(args)
     import torch
-    runtime = _runtime(torch)
+    runtime = _runtime(torch, args.run_kind)
     provenance, package_lock = _execution_provenance()
     tokenizer = _load_tokenizer()
     rows = validate_authoritative_corpus(args.corpus, args.corpus_manifest, args.finalizer_manifest)
-    lengths = audit_tokenize(tokenizer, rows)  # all 20k before model construction; never truncate/drop
-    order = tinker_single_epoch_order(EXPECTED_ROWS, 42)
-    resume_meta = validate_resume_checkpoint(args.resume_from, args, order) if args.resume_from else None
-    if resume_meta: _assert_disjoint_run(args.run_dir, args.resume_from, resume_meta)
-    args.run_dir.mkdir(parents=True)
+    lengths = audit_tokenize(tokenizer, rows)  # all 20k are audited before model construction
     try:
         with RunHeartbeat(args.run_dir) as heartbeat:
-            manifest = {"format": RUN_FORMAT, "plan": prepared, "lengths": lengths, "recipe": recipe_identity(), "runtime": runtime,
+            groups, total_steps = accumulation_group_sizes(), len(accumulation_group_sizes())
+            start_step, start_offset = (0, 0) if resume_meta is None else (resume_meta["global_step"], resume_meta["next_order_offset"])
+            target_step = total_steps if args.run_kind == "full" else start_step + 1
+            if target_step > total_steps:
+                raise ValidationError("smoke source checkpoint has no remaining optimizer group")
+            manifest = {"format": RUN_FORMAT, "run_kind": args.run_kind, "launcher_evidence": launcher, "accepted_smoke": args.accepted_smoke_identity,
+                        "accepted_resume_smoke": args.accepted_resume_smoke_identity,
+                        "plan": prepared, "lengths": lengths, "recipe": recipe_identity(), "runtime": runtime,
                         "base": {"id": BASE_ID, "revision": BASE_REVISION, "path": BASE_PATH}, "template": {"path": BASE_PATH, "sha256": sha256_text(tokenizer.chat_template)},
                         "data_order": {"composed_order_sha256": composed_order_sha256(order), "description": "load shuffle then same-seed fresh epoch shuffle"},
                         "checkpoint": {"format": CHECKPOINT_FORMAT, "schedule_steps": checkpoint_schedule(), "retain": CHECKPOINT_RETAIN}, "provenance": provenance,
-                        "continuation": None if not resume_meta else {"parent_run": resume_meta["run_dir"], "parent_checkpoint": str(args.resume_from.resolve())}}
+                        "continuation": None if resume_meta is None else {"parent_run": resume_meta["run_dir"], "parent_checkpoint": str(args.resume_from.resolve()), "parent_checkpoint_manifest_sha256": sha256_file(args.resume_from / "checkpoint-manifest.json"), "start_global_step": start_step, "start_next_order_offset": start_offset}}
             atomic_write_json(args.run_dir / "manifest.json", manifest)
+            atomic_write_json(args.run_dir / "runtime.json", runtime)
             _write_text_fsynced(args.run_dir / "package-lock.txt", package_lock)
-            torch.manual_seed(42); random.seed(42)
+            torch.manual_seed(args.seed); random.seed(args.seed)
             model, lora_targets, fast_paths = _load_model(torch, args.resume_from)
             atomic_write_json(args.run_dir / "lora-targets.json", {**lora_targets, "fast_paths": fast_paths})
             optimizer = make_tinker_adamw(torch, model.parameters(), args.lr, args.weight_decay)
-            step, offset = 0, 0
+            step, offset = start_step, start_offset
             if resume_meta:
                 state = validate_loaded_resume_state(torch, args.resume_from, resume_meta, tokenizer, model)
                 optimizer.load_state_dict(torch.load(args.resume_from / "optimizer.pt", map_location="cpu"))
-                step, offset = state["global_step"], state["next_order_offset"]; random.setstate(state["rng_python"]); torch.set_rng_state(state["rng_torch"]); torch.cuda.set_rng_state_all(state["rng_cuda"])
-            sizes, total_steps, corpus = accumulation_group_sizes(), len(accumulation_group_sizes()), LazyCorpus(args.corpus)
-            target_step = total_steps if args.max_steps is None else min(total_steps, step + args.max_steps)
-            if args.skip_save and (args.resume_from or target_step >= total_steps): raise ValidationError("skip-save only permits a non-resume partial smoke")
-            model.train(); optimizer.zero_grad(set_to_none=True)
+                step, offset = state["global_step"], state["next_order_offset"]
+                random.setstate(state["rng_python"]); torch.set_rng_state(state["rng_torch"]); torch.cuda.set_rng_state_all(state["rng_cuda"])
+                atomic_write_json(args.run_dir / "resume-restoration.json", {"format": "qwen35-4b-resume-restoration-v1",
+                                  "parent_checkpoint": str(args.resume_from.resolve()), "parent_checkpoint_manifest_sha256": sha256_file(args.resume_from / "checkpoint-manifest.json"),
+                                  "global_step": step, "next_order_offset": offset, "scheduler": state["scheduler"]})
+            corpus = LazyCorpus(args.corpus); model.train(); optimizer.zero_grad(set_to_none=True)
             while step < target_step:
-                size = sizes[step]; loss_sum = 0.0
+                size, loss_sum = groups[step], 0.0
                 for index in order[offset:offset + size]:
                     ids, labels, attention = _collate(corpus.feature(index, tokenizer), tokenizer.pad_token_id, torch)
                     loss_sum += backward_microbatch_loss(model(input_ids=ids.to("cuda"), labels=labels.to("cuda"), attention_mask=attention.to("cuda")).loss)
@@ -656,24 +883,150 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip); optimizer.step(); optimizer.zero_grad(set_to_none=True)
                 step += 1; offset += size
                 heartbeat.write_metric(event="step", step=step, total_steps=total_steps, examples_processed=offset, accumulation_group_size=size, batch_objective_sum=loss_sum, mean_loss_per_example=loss_sum / size, lr=lr, allocated_bytes=torch.cuda.max_memory_allocated())
-                if (offset % CHECKPOINT_EVERY_SAMPLES == 0 or offset == EXPECTED_ROWS or step == target_step) and not args.skip_save:
-                    metadata = {**_input_identity(args, order), "run_dir": str(args.run_dir.resolve()), "run_manifest_sha256": sha256_file(args.run_dir / "manifest.json"), "global_step": step, "total_steps": total_steps, "next_order_offset": offset, "examples_processed": offset, "training_complete": offset == EXPECTED_ROWS, "maximum_recomputed_processed_samples": MAX_RECOMPUTED_PROCESSED_SAMPLES, "scheduler": {"step": step, "total_steps": total_steps, "last_lr": lr}, "adapter_identity": _expected_adapter_identity(sha256_text(tokenizer.chat_template), lora_targets["normalized_target_names"])}
+                if offset % CHECKPOINT_EVERY_SAMPLES == 0 or offset == EXPECTED_ROWS or step == target_step:
+                    metadata = {**_input_identity(args, order), "run_kind": args.run_kind, "accepted_smoke": args.accepted_smoke_identity,
+                                "accepted_resume_smoke": args.accepted_resume_smoke_identity,
+                                "run_dir": str(args.run_dir.resolve()), "run_manifest_sha256": sha256_file(args.run_dir / "manifest.json"), "global_step": step, "total_steps": total_steps,
+                                "next_order_offset": offset, "examples_processed": offset, "training_complete": offset == EXPECTED_ROWS, "maximum_recomputed_processed_samples": MAX_RECOMPUTED_PROCESSED_SAMPLES,
+                                "scheduler": {"step": step, "total_steps": total_steps, "last_lr": lr}, "adapter_identity": _expected_adapter_identity(sha256_text(tokenizer.chat_template), lora_targets["normalized_target_names"])}
                     _publish_checkpoint(model, tokenizer, optimizer, torch, args.run_dir, metadata)
-            mark_done(args.run_dir, {"status": "DONE", "step": step, "total_steps": total_steps, "examples_processed": offset, "training_complete": offset == EXPECTED_ROWS, "smoke": target_step < total_steps})
+            mark_done(args.run_dir, {"status": "DONE", "run_kind": args.run_kind, "step": step, "total_steps": total_steps, "examples_processed": offset,
+                                     "training_complete": offset == EXPECTED_ROWS, "smoke": args.run_kind == "smoke", "skip_save": False, "optimizer_steps_this_run": step - start_step})
             return {"step": step, "total_steps": total_steps, "examples_processed": offset, "training_complete": offset == EXPECTED_ROWS}
     except BaseException as exc:
-        if args.run_dir.exists() and not (args.run_dir / "DONE").exists() and not (args.run_dir / "CRASHED").exists(): mark_crashed(args.run_dir, {"status": "CRASHED", "error_type": type(exc).__name__})
+        if args.run_dir.exists() and not (args.run_dir / "DONE").exists() and not (args.run_dir / "CRASHED").exists():
+            mark_crashed(args.run_dir, {"status": "CRASHED", "error_type": type(exc).__name__})
         raise
 
 
+def validate_completed_run(run_dir: Path, run_kind: str, *, runtime_reload: bool = False,
+                           require_fresh_smoke: bool = False, require_resume_smoke: bool = False) -> dict[str, Any]:
+    """Validate completed evidence without importing torch unless runtime reload is requested."""
+    if run_kind not in {"smoke", "full"}:
+        raise ValidationError("completed run kind must be smoke or full")
+    run_dir = Path(run_dir)
+    if (run_dir / "DONE").exists() == (run_dir / "CRASHED").exists():
+        raise ValidationError("completed run must contain exactly one terminal marker")
+    done = _load_json(run_dir / "DONE", "training terminal marker")
+    manifest = _load_json(run_dir / "manifest.json", "training manifest")
+    runtime = _load_json(run_dir / "runtime.json", "runtime evidence")
+    lora = _load_json(run_dir / "lora-targets.json", "LoRA target evidence")
+    if (done.get("status") != "DONE" or done.get("run_kind") != run_kind or done.get("skip_save") is not False
+            or manifest.get("format") != RUN_FORMAT or manifest.get("run_kind") != run_kind or manifest.get("runtime") != runtime
+            or runtime.get("run_kind") != run_kind or runtime.get("gpu", {}).get("name") not in AUTHORIZED_GPU_NAMES
+            or runtime.get("authorized_gpu_policy") != list(AUTHORIZED_GPU_NAMES)):
+        raise ValidationError("terminal, manifest, or immutable runtime role evidence differs")
+    launcher, provenance, plan_data = manifest.get("launcher_evidence"), manifest.get("provenance"), manifest.get("plan")
+    expected_order_sha = composed_order_sha256(tinker_single_epoch_order(EXPECTED_ROWS, 42))
+    if (not isinstance(launcher, dict) or launcher.get("format") != LAUNCH_EVIDENCE_FORMAT or
+            launcher.get("launch_json_sha256") != sha256_file(run_dir / "launch.json") or
+            not isinstance(provenance, dict) or provenance.get("repository", {}).get("commit") != launcher.get("commit") or
+            provenance.get("repository", {}).get("dirty") is not False or
+            provenance.get("script_sha256") != sha256_file(Path(__file__)) or
+            provenance.get("requirements_sha256") != sha256_file(Path(__file__).with_name("requirements-qwen35-4b-runpod.txt")) or
+            provenance.get("package_lock_sha256") != sha256_text((run_dir / "package-lock.txt").read_text(encoding="utf-8")) or
+            manifest.get("base") != {"id": BASE_ID, "revision": BASE_REVISION, "path": BASE_PATH} or
+            manifest.get("recipe") != recipe_identity() or
+            manifest.get("data_order", {}).get("composed_order_sha256") != expected_order_sha or
+            manifest.get("checkpoint") != {"format": CHECKPOINT_FORMAT, "schedule_steps": checkpoint_schedule(), "retain": CHECKPOINT_RETAIN} or
+            not isinstance(plan_data, dict) or plan_data.get("corpus_sha256") != FINAL_CORPUS_SHA256 or
+            plan_data.get("corpus", {}).get("ordering") != CORPUS_ORDERING or plan_data.get("corpus", {}).get("teacher") != TEACHER_MODEL_ID or
+            plan_data.get("staging", {}).get("verified") is not True or not isinstance(plan_data.get("staging", {}).get("manifest_sha256"), str)):
+        raise ValidationError("completed run is not bound to the frozen corpus, recipe, staging, or clean source commit")
+    lengths = manifest.get("lengths", {})
+    if lengths.get("row_count") != EXPECTED_ROWS or lengths.get("count_over_16384") != 0 or not isinstance(lengths.get("max"), int) or lengths["max"] > MAX_LENGTH:
+        raise ValidationError("run lacks a complete no-truncation 20,000-row token audit")
+    try:
+        normalized = lora["normalized_target_names"]
+        _validate_target_names(normalized)
+        if lora.get("resolved_target_count") != 248 or set(lora.get("layer_coverage", {})) != {"linear_attn_layers", "self_attn_layers", "mlp_layers"}:
+            raise ValidationError("bad target coverage")
+    except (KeyError, TypeError, ValidationError) as exc:
+        raise ValidationError("LoRA target coverage evidence differs") from exc
+    continuation = manifest.get("continuation")
+    start_step = 0 if continuation is None else continuation.get("start_global_step")
+    start_offset = 0 if continuation is None else continuation.get("start_next_order_offset")
+    expected_steps = 1 if run_kind == "smoke" else 157 - start_step
+    expected_step = start_step + expected_steps
+    expected_offset = EXPECTED_ROWS if run_kind == "full" else start_offset + 128
+    if (not isinstance(start_step, int) or not isinstance(start_offset, int) or done.get("optimizer_steps_this_run") != expected_steps
+            or done.get("step") != expected_step or done.get("total_steps") != 157 or done.get("examples_processed") != expected_offset
+            or done.get("training_complete") != (run_kind == "full") or done.get("smoke") != (run_kind == "smoke")
+            or (require_fresh_smoke and continuation is not None)
+            or (require_resume_smoke and (continuation is None or start_step != 1 or start_offset != 128 or expected_step != 2 or expected_offset != 256))):
+        raise ValidationError("completed run progress or fresh-smoke evidence differs")
+    if continuation is None:
+        if (run_dir / "resume-restoration.json").exists():
+            raise ValidationError("fresh run unexpectedly contains resume-restoration evidence")
+    else:
+        restoration = _load_json(run_dir / "resume-restoration.json", "resume restoration evidence")
+        if (restoration.get("format") != "qwen35-4b-resume-restoration-v1"
+                or restoration.get("parent_checkpoint") != continuation.get("parent_checkpoint")
+                or restoration.get("parent_checkpoint_manifest_sha256") != continuation.get("parent_checkpoint_manifest_sha256")
+                or restoration.get("global_step") != start_step or restoration.get("next_order_offset") != start_offset
+                or not isinstance(restoration.get("scheduler"), dict)):
+            raise ValidationError("resume restoration evidence differs from continuation")
+    metrics = list(iter_jsonl(run_dir / "metrics.jsonl"))
+    if len(metrics) != expected_steps or [entry.get("step") for entry in metrics] != list(range(start_step + 1, expected_step + 1)) or any(entry.get("total_steps") != 157 for entry in metrics):
+        raise ValidationError("metrics do not cover the required optimizer steps")
+    checkpoints = _checkpoint_index(run_dir)
+    terminal = run_dir / "checkpoints" / ("step-%06d" % expected_step)
+    if terminal not in checkpoints:
+        raise ValidationError("terminal checkpoint is absent from verified retained index")
+    if run_kind == "full" and [item.name for item in checkpoints] != ["step-000156", "step-000157"]:
+        raise ValidationError("full run must retain verified steps 156 and 157")
+    metadata = validate_checkpoint_payload(terminal).get("metadata", {})
+    if (metadata.get("run_kind") != run_kind or metadata.get("global_step") != expected_step or metadata.get("next_order_offset") != expected_offset
+            or metadata.get("training_complete") != (run_kind == "full") or metadata.get("accepted_smoke") != manifest.get("accepted_smoke")
+            or metadata.get("accepted_resume_smoke") != manifest.get("accepted_resume_smoke")
+            or metadata.get("corpus_sha256") != FINAL_CORPUS_SHA256 or metadata.get("corpus_manifest_sha256") != CORPUS_MANIFEST_SHA256
+            or metadata.get("finalizer_manifest_sha256") != FINALIZER_MANIFEST_SHA256
+            or metadata.get("staging_manifest_sha256") != plan_data["staging"]["manifest_sha256"]
+            or metadata.get("composed_order_sha256") != expected_order_sha or metadata.get("recipe") != recipe_identity()
+            or not isinstance(metadata.get("adapter_identity"), dict)):
+        raise ValidationError("terminal checkpoint metadata differs")
+    if run_kind == "full":
+        accepted, accepted_resume = manifest.get("accepted_smoke"), manifest.get("accepted_resume_smoke")
+        if (not isinstance(accepted, dict) or not isinstance(accepted.get("path"), str) or
+                not isinstance(accepted_resume, dict) or not isinstance(accepted_resume.get("path"), str)):
+            raise ValidationError("full run lacks fresh-smoke and resume-smoke bindings")
+        local_smoke = Path(accepted["path"])
+        if not local_smoke.is_dir(): local_smoke = run_dir.parent / str(accepted.get("run_id", ""))
+        actual_smoke = _accepted_smoke_identity(local_smoke, run_dir, require_remote_child=False, identity_path=accepted["path"], runtime_reload=runtime_reload)
+        local_resume = Path(accepted_resume["path"])
+        if not local_resume.is_dir(): local_resume = run_dir.parent / str(accepted_resume.get("run_id", ""))
+        actual_resume = _accepted_resume_smoke_identity(local_resume, actual_smoke, run_dir, require_remote_child=False, identity_path=accepted_resume["path"], runtime_reload=runtime_reload)
+        if actual_smoke != accepted or actual_resume != accepted_resume:
+            raise ValidationError("full smoke-gate bindings differ from accepted evidence")
+    if runtime_reload:
+        import torch
+        _runtime(torch, run_kind)
+        tokenizer = _load_tokenizer()
+        model, _, _ = _load_model(torch, terminal)
+        state = torch.load(terminal / "trainer-state.pt", map_location="cpu")
+        optimizer_state = torch.load(terminal / "optimizer.pt", map_location="cpu")
+        if not isinstance(state, dict) or not isinstance(optimizer_state, dict) or state.get("scheduler") != metadata.get("scheduler"):
+            raise ValidationError("runtime checkpoint reload differs from static evidence")
+        optimizer = make_tinker_adamw(torch, model.parameters(), FROZEN["lr"], FROZEN["weight_decay"])
+        optimizer.load_state_dict(optimizer_state)
+        if len(optimizer.param_groups) != 1 or not optimizer.state:
+            raise ValidationError("runtime optimizer restoration is empty or structurally invalid")
+        validate_loaded_resume_state(torch, terminal, metadata, tokenizer, model)
+        if run_kind == "smoke" and continuation is None:
+            _smoke_acceptance(run_dir, create=True)
+        elif run_kind == "smoke":
+            _resume_smoke_acceptance(run_dir, create=True)
+    return {"run_kind": run_kind, "checkpoint": terminal.name, "step": expected_step, "examples_processed": expected_offset}
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__); mode = parser.add_mutually_exclusive_group(required=True); mode.add_argument("--plan", action="store_true"); mode.add_argument("--execute", action="store_true")
-    parser.add_argument("--corpus", type=Path, default=CORPUS_PATH); parser.add_argument("--corpus-manifest", type=Path, default=CORPUS_MANIFEST_PATH); parser.add_argument("--finalizer-manifest", type=Path, default=FINALIZER_MANIFEST_PATH); parser.add_argument("--evaluation-questions", type=Path, default=EVALUATION_QUESTIONS_PATH); parser.add_argument("--staging-manifest", type=Path, required=True); parser.add_argument("--run-dir", type=Path, required=True)
+    parser = argparse.ArgumentParser(description=__doc__); mode = parser.add_mutually_exclusive_group(required=True); mode.add_argument("--plan", action="store_true"); mode.add_argument("--execute", action="store_true"); mode.add_argument("--validate-completed", action="store_true")
+    parser.add_argument("--corpus", type=Path, default=CORPUS_PATH); parser.add_argument("--corpus-manifest", type=Path, default=CORPUS_MANIFEST_PATH); parser.add_argument("--finalizer-manifest", type=Path, default=FINALIZER_MANIFEST_PATH); parser.add_argument("--evaluation-questions", type=Path, default=EVALUATION_QUESTIONS_PATH); parser.add_argument("--staging-manifest", type=Path); parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--base-path", default=BASE_PATH); parser.add_argument("--base-revision", default=BASE_REVISION); parser.add_argument("--seed", type=int, default=42)
     for key, value in FROZEN.items(): parser.add_argument("--" + key.replace("_", "-"), type=type(value), default=value)
-    parser.add_argument("--checkpoint-every-samples", type=int, default=CHECKPOINT_EVERY_SAMPLES); parser.add_argument("--checkpoint-retain", type=int, default=CHECKPOINT_RETAIN); parser.add_argument("--resume-from", type=Path); parser.add_argument("--max-steps", type=int); parser.add_argument("--skip-save", action="store_true")
+    parser.add_argument("--checkpoint-every-samples", type=int, default=CHECKPOINT_EVERY_SAMPLES); parser.add_argument("--checkpoint-retain", type=int, default=CHECKPOINT_RETAIN); parser.add_argument("--resume-from", type=Path); parser.add_argument("--accepted-smoke-run", type=Path); parser.add_argument("--accepted-resume-smoke-run", type=Path); parser.add_argument("--max-steps", type=int); parser.add_argument("--skip-save", action="store_true"); parser.add_argument("--run-kind", choices=("smoke", "full")); parser.add_argument("--validation-mode", choices=("static", "runtime"), default="static")
     return parser
 
 
 if __name__ == "__main__":
-    parsed = build_parser().parse_args(); print(json.dumps(plan(parsed) if parsed.plan else execute(parsed), sort_keys=True, default=str))
+    parsed = build_parser().parse_args(); print(json.dumps(plan(parsed) if parsed.plan else validate_completed_run(parsed.run_dir, parsed.run_kind, runtime_reload=parsed.validation_mode == "runtime") if parsed.validate_completed else execute(parsed), sort_keys=True, default=str))

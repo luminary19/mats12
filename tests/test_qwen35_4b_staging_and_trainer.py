@@ -3,6 +3,7 @@ import json
 import os
 import pickle
 import random
+import sys
 import tempfile
 import types
 import unittest
@@ -26,7 +27,7 @@ class StageContractTests(unittest.TestCase):
                  "files": files, "file_count": count, "bytes": total, "download_metadata_verified": True,
                  "runtime": {"python": "test", "platform": "test", "packages": dict(staging.RUNTIME_VERSIONS)},
                  "artifacts": {"script": {"path": "experiment/stage_qwen35_4b_base.py", "sha256": sha256_file(Path(staging.__file__))}, "requirements": {"path": staging.REQUIREMENTS, "sha256": sha256_file(staging._requirements_path())}},
-                 "offline_validation": {"model_class": "Qwen3_5ForConditionalGeneration", "model_type": "qwen3_5", "language_layers": 32, "chat_template_sha256": "a" * 64, "no_thinking_prefix_contains_empty_think_block": True, "processor_class": "Processor", "tokenizer_class": "Tokenizer", "parameter_count": 1, "smoke": {"generated_tokens": 1}}}
+                 "offline_validation": {"model_class": "Qwen3_5ForConditionalGeneration", "model_type": "qwen3_5", "language_layers": 32, "chat_template_sha256": "a" * 64, "no_thinking_prefix_contains_empty_think_block": True, "processor_class": "Processor", "tokenizer_class": "Tokenizer", "parameter_count": 1, "fast_paths": {"flash-linear-attention": True, "causal-conv1d": True}, "gpu": {"name": staging.AUTHORIZED_GPU_NAMES[0], "authorized_policy": list(staging.AUTHORIZED_GPU_NAMES)}, "smoke": {"generated_tokens": 1}}}
         value["integrity_sha256"] = staging._manifest_integrity(value)
         manifest = root / "model-manifest.json"; atomic_write_json(manifest, value)
         return model, manifest
@@ -172,15 +173,33 @@ class TrainerPureContractTests(unittest.TestCase):
         with patch.object(trainer, "AMENDMENT_SHA256", "0" * 64):
             with self.assertRaises(ValidationError): trainer._validate_amendment()
 
-    def test_execution_guards_reject_zero_full_skip_and_non_durable_run_paths(self):
-        args = types.SimpleNamespace(max_steps=0, skip_save=False, resume_from=None, effective_batch=128)
+    def test_run_kind_and_full_execution_guards_fail_closed(self):
+        args = types.SimpleNamespace(run_kind=None, max_steps=1, skip_save=False, resume_from=None, accepted_smoke_run=None, accepted_resume_smoke_run=None)
         with self.assertRaises(ValidationError): trainer._validate_execution_mode(args)
-        args.max_steps, args.skip_save = None, True
+        args.run_kind, args.max_steps = "smoke", 0
         with self.assertRaises(ValidationError): trainer._validate_execution_mode(args)
-        args.max_steps, args.skip_save = 1, False
+        args.max_steps, args.skip_save = 1, True
+        with self.assertRaises(ValidationError): trainer._validate_execution_mode(args)
+        args.skip_save = False
+        trainer._validate_execution_mode(args)
+        args.run_kind, args.max_steps = "full", 1
+        with self.assertRaises(ValidationError): trainer._validate_execution_mode(args)
+        args.max_steps, args.accepted_smoke_run = None, None
+        with self.assertRaises(ValidationError): trainer._validate_execution_mode(args)
+        args.accepted_smoke_run = Path("/workspace/runs/smoke")
+        with self.assertRaises(ValidationError): trainer._validate_execution_mode(args)
+        args.accepted_resume_smoke_run = Path("/workspace/runs/resume-smoke")
         trainer._validate_execution_mode(args)
         with self.assertRaises(ValidationError): trainer._safe_training_run_dir(Path("local-run"))
         self.assertEqual(trainer._safe_training_run_dir(Path("/workspace/runs/new-run")), Path("/workspace/runs/new-run"))
+
+    def test_exact_authorized_gpu_allowlist_and_amendment_semantics(self):
+        self.assertEqual(trainer.AUTHORIZED_GPU_NAMES, ("NVIDIA RTX PRO 6000 Blackwell Server Edition", "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "NVIDIA RTX PRO 4500 Blackwell"))
+        self.assertNotIn("NVIDIA A100-SXM4-80GB", trainer.AUTHORIZED_GPU_NAMES)
+        self.assertEqual(trainer._validate_amendment(), trainer.AMENDMENT_SHA256)
+        amendment = json.loads((Path(trainer._repo_root()) / trainer.AMENDMENT).read_text(encoding="utf-8"))
+        self.assertEqual(amendment["authorization"]["hardware_policy"]["ordered_exact_names"], list(trainer.AUTHORIZED_GPU_NAMES))
+        self.assertEqual(amendment["roles"]["full"]["optimizer_steps"], 157)
 
 
 class FakeTorch:
@@ -241,6 +260,128 @@ class CheckpointTests(unittest.TestCase):
             self.assertEqual(index["checkpoints"], ["step-000008", "step-000012"])
             self.assertTrue(all((checkpoint_root / name).is_dir() for name in index["checkpoints"]))
             self.assertTrue((checkpoint_root / "step-000004").is_dir())
+
+
+class CompletedRunValidationTests(unittest.TestCase):
+    def _write_completed(self, root, name, kind, *, continuation=None, accepted=None, accepted_resume=None):
+        run = root / name; run.mkdir()
+        runtime = {"gpu": {"name": trainer.AUTHORIZED_GPU_NAMES[0], "total_memory": 1}, "packages": {}, "python": "test", "run_kind": kind, "authorized_gpu_policy": list(trainer.AUTHORIZED_GPU_NAMES)}
+        start_step = 0 if continuation is None else continuation["start_global_step"]
+        start_offset = 0 if continuation is None else continuation["start_next_order_offset"]
+        final_step = start_step + 1 if kind == "smoke" else 157
+        final_offset = start_offset + 128 if kind == "smoke" else 20_000
+        commit = "a" * 40
+        launch = {"format": trainer.LAUNCH_EVIDENCE_FORMAT, "run_id": name, "commit": commit, "pid": 1, "start_identity": "1"}
+        atomic_write_json(run / "launch.json", launch)
+        launcher = {"format": trainer.LAUNCH_EVIDENCE_FORMAT, "launch_json_sha256": sha256_file(run / "launch.json"), "run_id": name, "commit": commit, "pid": 1, "start_identity": "1", "stdout": "stdout.log", "stderr": "stderr.log"}
+        (run / "stdout.log").write_text("", encoding="utf-8"); (run / "stderr.log").write_text("", encoding="utf-8")
+        package_lock = "lock\n"; (run / "package-lock.txt").write_text(package_lock, encoding="utf-8")
+        plan = {"corpus_sha256": trainer.FINAL_CORPUS_SHA256, "corpus": {"ordering": trainer.CORPUS_ORDERING, "teacher": trainer.TEACHER_MODEL_ID},
+                "staging": {"verified": True, "manifest_sha256": "b" * 64}}
+        provenance = {"repository": {"commit": commit, "dirty": False}, "script_sha256": sha256_file(Path(trainer.__file__)),
+                      "requirements_sha256": sha256_file(Path(trainer.__file__).with_name("requirements-qwen35-4b-runpod.txt")),
+                      "package_lock_sha256": trainer.sha256_text(package_lock)}
+        manifest = {"format": trainer.RUN_FORMAT, "run_kind": kind, "runtime": runtime, "launcher_evidence": launcher,
+                    "accepted_smoke": accepted, "accepted_resume_smoke": accepted_resume, "plan": plan, "recipe": trainer.recipe_identity(),
+                    "base": {"id": trainer.BASE_ID, "revision": trainer.BASE_REVISION, "path": trainer.BASE_PATH},
+                    "data_order": {"composed_order_sha256": trainer.composed_order_sha256(trainer.tinker_single_epoch_order(20_000, 42))},
+                    "checkpoint": {"format": trainer.CHECKPOINT_FORMAT, "schedule_steps": trainer.checkpoint_schedule(), "retain": trainer.CHECKPOINT_RETAIN},
+                    "provenance": provenance, "lengths": {"row_count": 20_000, "count_over_16384": 0, "max": 100}, "continuation": continuation}
+        atomic_write_json(run / "manifest.json", manifest)
+        atomic_write_json(run / "runtime.json", runtime)
+        if continuation is not None:
+            atomic_write_json(run / "resume-restoration.json", {"format": "qwen35-4b-resume-restoration-v1", "parent_checkpoint": continuation.get("parent_checkpoint"),
+                              "parent_checkpoint_manifest_sha256": continuation.get("parent_checkpoint_manifest_sha256"), "global_step": start_step, "next_order_offset": start_offset,
+                              "scheduler": {"step": start_step, "total_steps": 157, "last_lr": 0.0}})
+        atomic_write_json(run / "lora-targets.json", {"normalized_target_names": sorted(trainer.expected_language_target_names()), "resolved_target_count": 248,
+                          "layer_coverage": {"linear_attn_layers": list(range(24)), "self_attn_layers": list(range(24, 32)), "mlp_layers": list(range(32))}})
+        metrics = []
+        for step in range(start_step + 1, final_step + 1): metrics.append({"event": "step", "step": step, "total_steps": 157})
+        (run / "metrics.jsonl").write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in metrics), encoding="utf-8")
+        steps = [final_step] if kind == "smoke" else [156, 157]
+        for step in steps:
+            offset = final_offset if step == final_step else 19_968
+            metadata = {"run_kind": kind, "accepted_smoke": accepted, "accepted_resume_smoke": accepted_resume, "run_dir": str(run.resolve()), "run_manifest_sha256": sha256_file(run / "manifest.json"),
+                        "global_step": step, "total_steps": 157, "next_order_offset": offset, "examples_processed": offset,
+                        "training_complete": kind == "full" and step == 157, "maximum_recomputed_processed_samples": trainer.MAX_RECOMPUTED_PROCESSED_SAMPLES,
+                        "corpus_sha256": trainer.FINAL_CORPUS_SHA256, "corpus_manifest_sha256": trainer.CORPUS_MANIFEST_SHA256,
+                        "finalizer_manifest_sha256": trainer.FINALIZER_MANIFEST_SHA256, "staging_manifest_sha256": "b" * 64,
+                        "composed_order_sha256": trainer.composed_order_sha256(trainer.tinker_single_epoch_order(20_000, 42)), "recipe": trainer.recipe_identity(),
+                        "scheduler": {"step": step, "total_steps": 157, "last_lr": 0.0}, "adapter_identity": trainer._expected_adapter_identity("template")}
+            trainer._publish_checkpoint(FakeSaveable(), FakeTokenizer(), types.SimpleNamespace(state_dict=lambda: {}), FakeTorch(), run, metadata)
+        atomic_write_json(run / "DONE", {"status": "DONE", "run_kind": kind, "step": final_step, "total_steps": 157, "examples_processed": final_offset,
+                                            "training_complete": kind == "full", "smoke": kind == "smoke", "skip_save": False, "optimizer_steps_this_run": final_step - start_step})
+        return run
+
+    def test_static_smoke_full_binding_and_tamper_fail_closed_without_torch_import(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            smoke = self._write_completed(root, "smoke", "smoke")
+            before = sys.modules.get("torch")
+            self.assertEqual(trainer.validate_completed_run(smoke, "smoke"), {"run_kind": "smoke", "checkpoint": "step-000001", "step": 1, "examples_processed": 128})
+            self.assertIs(sys.modules.get("torch"), before)
+            with self.assertRaises(ValidationError): trainer._accepted_smoke_identity(smoke, root / "full", require_remote_child=False, identity_path="/workspace/runs/smoke")
+            trainer._smoke_acceptance(smoke, create=True)
+            accepted = trainer._accepted_smoke_identity(smoke, root / "full", require_remote_child=False, identity_path="/workspace/runs/smoke")
+            continuation = {"parent_run": str(smoke), "parent_checkpoint": str(smoke / "checkpoints/step-000001"),
+                            "parent_checkpoint_manifest_sha256": sha256_file(smoke / "checkpoints/step-000001/checkpoint-manifest.json"),
+                            "start_global_step": 1, "start_next_order_offset": 128}
+            resumed = self._write_completed(root, "resumed", "smoke", continuation=continuation)
+            trainer._resume_smoke_acceptance(resumed, create=True)
+            accepted_resume = trainer._accepted_resume_smoke_identity(resumed, accepted, root / "full", require_remote_child=False, identity_path="/workspace/runs/resumed")
+            full = self._write_completed(root, "full", "full", accepted=accepted, accepted_resume=accepted_resume)
+            self.assertEqual(trainer.validate_completed_run(full, "full")["checkpoint"], "step-000157")
+            done = json.loads((full / "DONE").read_text(encoding="utf-8")); done["skip_save"] = True
+            atomic_write_json(full / "DONE", done, overwrite=True)
+            with self.assertRaises(ValidationError): trainer.validate_completed_run(full, "full")
+
+    def test_resume_smoke_requires_disjoint_continuation_and_runtime_reload_seam(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fresh = self._write_completed(root, "fresh", "smoke")
+            continuation = {"parent_run": str(fresh), "parent_checkpoint": str(fresh / "checkpoints/step-000001"),
+                            "parent_checkpoint_manifest_sha256": sha256_file(fresh / "checkpoints/step-000001/checkpoint-manifest.json"),
+                            "start_global_step": 1, "start_next_order_offset": 128}
+            resumed = self._write_completed(root, "resumed", "smoke", continuation=continuation)
+            self.assertEqual(trainer.validate_completed_run(resumed, "smoke")["step"], 2)
+            (resumed / "resume-restoration.json").unlink()
+            with self.assertRaises(ValidationError): trainer.validate_completed_run(resumed, "smoke")
+            atomic_write_json(resumed / "resume-restoration.json", {"format": "qwen35-4b-resume-restoration-v1", "parent_checkpoint": continuation["parent_checkpoint"], "parent_checkpoint_manifest_sha256": continuation["parent_checkpoint_manifest_sha256"], "global_step": 1, "next_order_offset": 128, "scheduler": {"step": 1, "total_steps": 157, "last_lr": 0.0}})
+            with self.assertRaises(ValidationError): trainer.validate_completed_run(resumed, "smoke", require_fresh_smoke=True)
+            def load(path, **kwargs):
+                if str(path).endswith("optimizer.pt"): return {"state": {"x": 1}, "param_groups": [{}]}
+                step = 1 if "000001" in str(path) else 2
+                return {"scheduler": {"step": step, "total_steps": 157, "last_lr": 0.0}}
+            fake_torch = types.SimpleNamespace(load=load)
+            class Optimizer:
+                def __init__(self): self.param_groups=[{}]; self.state={}
+                def load_state_dict(self, value): self.state={"restored": value}
+            fake_model = types.SimpleNamespace(parameters=lambda: [])
+            with patch.dict(sys.modules, {"torch": fake_torch}), patch.object(trainer, "_runtime"), patch.object(trainer, "_load_tokenizer", return_value=FakeTokenizer()), patch.object(trainer, "_load_model", return_value=(fake_model, {}, {})), patch.object(trainer, "make_tinker_adamw", return_value=Optimizer()), patch.object(trainer, "validate_loaded_resume_state") as restored:
+                trainer.validate_completed_run(resumed, "smoke", runtime_reload=True)
+                trainer.validate_completed_run(fresh, "smoke", runtime_reload=True)
+                self.assertEqual(restored.call_count, 2)
+            self.assertTrue((fresh / "SMOKE_ACCEPTED").is_file())
+            self.assertTrue((resumed / "RESUME_SMOKE_ACCEPTED").is_file())
+
+
+class LauncherAndWatcherContractTests(unittest.TestCase):
+    def test_launcher_and_watcher_use_safe_detached_handoff_and_fail_open_deletion_gate(self):
+        launcher = Path("scripts/train-qwen35-4b-lora.ps1").read_text(encoding="ascii")
+        watcher = Path("scripts/watch-qwen35-4b-training.ps1").read_text(encoding="ascii")
+        self.assertIn("qwen35-4b-trainer-launch-v1", launcher)
+        self.assertIn("Copy-FileToPod", launcher)
+        self.assertNotIn("$args", launcher)
+        self.assertIn("elif test -f", launcher)
+        self.assertIn("Invoke-Qwen35SmokeValidation", launcher)
+        self.assertIn("sha256sum", watcher)
+        self.assertIn("ExpectedPodId", watcher)
+        self.assertIn("ExpectedCommit", watcher)
+        self.assertIn("leaving pod untouched", watcher)
+        self.assertIn("pod-down.ps1", watcher)
+        self.assertIn("AcceptedResumeSmokeRunId", watcher)
+        self.assertIn("ResumeFull", launcher)
+        self.assertTrue(Path("scripts/stage-qwen35-4b.ps1").is_file())
 
 
 if __name__ == "__main__":

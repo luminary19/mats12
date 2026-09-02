@@ -12,6 +12,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -31,6 +32,9 @@ HF_HUB_DISABLE_XET = "1"
 MANIFEST_FORMAT = "qwen35-4b-base-staging-v1"
 REQUIREMENTS = "experiment/requirements-qwen35-4b-runpod.txt"
 RUNTIME_VERSIONS = {"torch": "2.8.0+cu128", "transformers": "5.16.1", "huggingface-hub": "1.28.0", "accelerate": "1.10.1", "peft": "0.18.1", "safetensors": "0.8.0", "flash-linear-attention": "0.5.2", "causal-conv1d": "1.7.0"}
+AUTHORIZED_GPU_NAMES = ("NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                        "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+                        "NVIDIA RTX PRO 4500 Blackwell")
 REQUIRED_SNAPSHOT_FILES = {"config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors.index.json"}
 MIN_SNAPSHOT_BYTES = 1_000_000_000
 
@@ -158,7 +162,14 @@ def verify_manifest(manifest_path: Path, *, verify_files: bool = True) -> dict[s
     if artifacts != expected_artifacts:
         raise ValidationError("Qwen staging script or requirements identity differs")
     offline = manifest.get("offline_validation")
-    if not isinstance(offline, dict) or {key: offline.get(key) for key in ("model_class", "model_type", "language_layers", "no_thinking_prefix_contains_empty_think_block")} != {"model_class": "Qwen3_5ForConditionalGeneration", "model_type": "qwen3_5", "language_layers": 32, "no_thinking_prefix_contains_empty_think_block": True} or not isinstance(offline.get("chat_template_sha256"), str) or len(offline["chat_template_sha256"]) != 64 or not isinstance(offline.get("processor_class"), str) or not isinstance(offline.get("tokenizer_class"), str) or not isinstance(offline.get("parameter_count"), int) or offline["parameter_count"] < 1 or not isinstance(offline.get("smoke"), dict) or not isinstance(offline["smoke"].get("generated_tokens"), int) or offline["smoke"]["generated_tokens"] < 1:
+    if (not isinstance(offline, dict) or {key: offline.get(key) for key in ("model_class", "model_type", "language_layers", "no_thinking_prefix_contains_empty_think_block")} != {"model_class": "Qwen3_5ForConditionalGeneration", "model_type": "qwen3_5", "language_layers": 32, "no_thinking_prefix_contains_empty_think_block": True}
+            or not isinstance(offline.get("chat_template_sha256"), str) or len(offline["chat_template_sha256"]) != 64
+            or not isinstance(offline.get("processor_class"), str) or not isinstance(offline.get("tokenizer_class"), str)
+            or not isinstance(offline.get("parameter_count"), int) or offline["parameter_count"] < 1
+            or offline.get("fast_paths") != {"flash-linear-attention": True, "causal-conv1d": True}
+            or offline.get("gpu", {}).get("name") not in AUTHORIZED_GPU_NAMES
+            or offline.get("gpu", {}).get("authorized_policy") != list(AUTHORIZED_GPU_NAMES)
+            or not isinstance(offline.get("smoke"), dict) or not isinstance(offline["smoke"].get("generated_tokens"), int) or offline["smoke"]["generated_tokens"] < 1):
         raise ValidationError("Qwen staging offline architecture/template evidence differs")
     if verify_files:
         root = Path(LOCAL_DIR)
@@ -197,10 +208,17 @@ def _assert_cuda_only(model: Any) -> int:
 def _assert_runtime_and_load(root: Path) -> dict[str, Any]:
     """Offline model/template smoke after snapshot integrity has been checked."""
     import torch
+    import transformers.utils as transformers_utils
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
     if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
         raise ValidationError("staging requires exactly one CUDA GPU")
+    gpu_name = torch.cuda.get_device_name(0)
+    if gpu_name not in AUTHORIZED_GPU_NAMES:
+        raise ValidationError("staging GPU is not in the authorized exact-name policy: %s" % gpu_name)
+    if (not getattr(transformers_utils, "is_fla_available", lambda: False)() or
+            not getattr(transformers_utils, "is_causal_conv1d_available", lambda: False)()):
+        raise ValidationError("staging requires the pinned hybrid-attention fast paths")
     torch.cuda.reset_peak_memory_stats(0)
     processor = AutoProcessor.from_pretrained(root, revision=REVISION, local_files_only=True,
                                               trust_remote_code=False)
@@ -244,9 +262,10 @@ def _assert_runtime_and_load(root: Path) -> dict[str, Any]:
                 "tokenizer_class": tokenizer.__class__.__name__,
                 "processor_class": processor.__class__.__name__,
                 "chat_template_sha256": sha256_text(tokenizer.chat_template),
+                "fast_paths": {"flash-linear-attention": True, "causal-conv1d": True},
                 "no_thinking_prefix_contains_empty_think_block": True,
                 "parameter_count": parameter_count,
-                "gpu": {"name": torch.cuda.get_device_name(0),
+                "gpu": {"name": gpu_name, "authorized_policy": list(AUTHORIZED_GPU_NAMES),
                         "peak_allocated_bytes": torch.cuda.max_memory_allocated(0)},
                 "smoke": {"max_new_tokens": 4, "generated_tokens": int(output.shape[-1] - inputs.shape[-1])}}
     finally:
@@ -256,6 +275,9 @@ def _assert_runtime_and_load(root: Path) -> dict[str, Any]:
 
 def execute(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = _safe_run_dir(args.run_dir)
+    repository = _git_state(Path(__file__).resolve().parents[1])
+    if repository.get("dirty") is not False or not re.fullmatch(r"[0-9a-f]{40}", str(repository.get("commit", ""))):
+        raise ValidationError("staging requires a clean committed project checkout")
     os.environ["HF_HOME"] = HF_HOME
     os.environ["HF_HUB_DISABLE_XET"] = HF_HUB_DISABLE_XET
     run_dir.mkdir(parents=True)
@@ -280,7 +302,7 @@ def execute(args: argparse.Namespace) -> dict[str, Any]:
                 "hf": {"HF_HOME": HF_HOME, "HF_HUB_DISABLE_XET": HF_HUB_DISABLE_XET},
                 "files": files, "file_count": count, "bytes": total, "download_metadata_verified": True,
                 "runtime": {"python": sys.version, "platform": platform.platform(), "packages": _packages()},
-                "repository": _git_state(Path(__file__).resolve().parents[1]),
+                "repository": repository,
                 "artifacts": {"script": {"path": "experiment/stage_qwen35_4b_base.py", "sha256": sha256_file(Path(__file__))},
                               "requirements": {"path": REQUIREMENTS, "sha256": sha256_file(requirements)}},
                 "offline_validation": smoke, "created_unix": time.time()}

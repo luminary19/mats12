@@ -170,3 +170,7 @@ Use the ASCII PowerShell 5.1 launcher for preparation and offline planning, then
 .\scripts\judge-coherence.ps1 -RunDir runs\coherence-study-YYYYMMDDTHHMMZ
 .\scripts\judge-coherence.ps1 -RunDir runs\coherence-study-YYYYMMDDTHHMMZ -Execute
 ```
+
+## Authorized Qwen3.5-4B Base LoRA path
+
+`train_qwen35_4b_lora_local` is the checksum-bound, single-GPU Qwen path. `--plan` is offline and CPU-lazy; before staging it reports the required staging gate. Execution requires a verified pinned staging manifest, then tokenizes/audits all 20,000 rows before constructing the model. Use `--run-kind smoke --max-steps 1` for the saved 128-sample smoke (a disjoint `--resume-from` smoke proves restoration); use `--run-kind full --accepted-smoke-run <fresh-smoke-run>` for the 157-step full run. `--validate-completed --validation-mode static` imports no Torch; `runtime` reload validation is required on the pod for the accepted fresh smoke. Only the three exact authorized Blackwell GPU names in the amendment are accepted.
