@@ -18,7 +18,7 @@ from experiment.batch_io import ValidationError, atomic_write_json, sha256_file
 class StageContractTests(unittest.TestCase):
     def _manifest(self, root):
         model = root / "model"; model.mkdir()
-        for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors.index.json", "model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"):
+        for name in ("config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors.index.json", "model.safetensors-00001-of-00002.safetensors", "model.safetensors-00002-of-00002.safetensors"):
             (model / name).write_text("x", encoding="utf-8")
         files, count, total = staging._file_manifest(model)
         value = {"format": staging.MANIFEST_FORMAT, "repo_id": staging.REPO_ID,

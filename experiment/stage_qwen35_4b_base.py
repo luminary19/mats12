@@ -149,7 +149,7 @@ def verify_manifest(manifest_path: Path, *, verify_files: bool = True) -> dict[s
     files = manifest.get("files")
     if not isinstance(files, dict) or not files or not REQUIRED_SNAPSHOT_FILES.issubset(files):
         raise ValidationError("Qwen staging manifest lacks required snapshot files")
-    shards = sorted(name for name in files if name.startswith("model-") and name.endswith(".safetensors"))
+    shards = sorted(name for name in files if re.fullmatch(r"model\.safetensors-[0-9]{5}-of-[0-9]{5}\.safetensors", name))
     if len(shards) != 2 or not isinstance(manifest.get("file_count"), int) or manifest["file_count"] != len(files) or not isinstance(manifest.get("bytes"), int) or manifest["bytes"] < MIN_SNAPSHOT_BYTES:
         raise ValidationError("Qwen staging manifest has implausible snapshot count, shards, or bytes")
     if any(not isinstance(item, dict) or set(item) != {"bytes", "sha256"} or not isinstance(item["bytes"], int) or item["bytes"] < 1 or not isinstance(item["sha256"], str) or len(item["sha256"]) != 64 for item in files.values()):
