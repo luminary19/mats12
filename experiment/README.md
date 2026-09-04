@@ -194,3 +194,12 @@ Use an unused direct child of `runs` with a safe run ID. The launcher always run
 .\scripts\judge-qwen35-4b.ps1 -RunDir runs\qwen35-4b-paired-judge-20260902T070000Z
 .\scripts\judge-qwen35-4b.ps1 -RunDir runs\qwen35-4b-paired-judge-20260902T070000Z -Execute
 ```
+
+## Paired Qwen3.5-4B coherence judging
+
+`experiment.prepare_qwen35_4b_coherence` binds the completed base and adapter formal runs into the same normalized schema used by the six-arm study. `experiment.judge_qwen35_4b_coherence` supplies those two arms to the unchanged coherence engine, so the prompt, Gemini settings, first-score-tag parser, acquisition evidence, retry behavior, concurrency, result schema, score bands, and summary format remain identical. The launcher prepares and plans offline before explicit paid execution:
+
+```powershell
+.\scripts\judge-qwen35-4b-coherence.ps1 -RunDir runs\coherence-study-qwen35-4b-YYYYMMDDTHHMMZ
+.\scripts\judge-qwen35-4b-coherence.ps1 -RunDir runs\coherence-study-qwen35-4b-YYYYMMDDTHHMMZ -Execute
+```
